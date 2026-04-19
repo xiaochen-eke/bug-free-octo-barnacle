@@ -1,0 +1,3 @@
+python game_data_api.py
+python app.py
+npm start
