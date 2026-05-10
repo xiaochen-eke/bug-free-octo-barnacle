@@ -1,0 +1,545 @@
+/* ========== 全局样式 ========== */
+
+:root {
+  /* 饥荒主题色 - 深色恐怖风格 */
+  --primary: #d4af37;        /* 金色 - 游戏经典色 */
+  --dark-bg: #1a1a1a;        /* 深黑 */
+  --card-bg: #2d2d2d;        /* 卡片背景 */
+  --border: #404040;         /* 边框 */
+  --text-primary: #e0e0e0;   /* 主文本 */
+  --text-secondary: #888;    /* 次文本 */
+  --user-msg: #3a5a3a;       /* 用户消息 - 暗绿 */
+  --bot-msg: #2a3a4a;        /* 机器人消息 - 暗蓝 */
+  --success: #4ade80;        /* 成功绿 */
+  --warning: #f59e0b;        /* 警告橙 */
+  --danger: #ef4444;         /* 危险红 */
+  
+  /* 字体 */
+  --font-display: 'Courier Prime', 'SF Mono', monospace;
+  --font-body: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  
+  /* 间距 */
+  --spacing-xs: 4px;
+  --spacing-sm: 8px;
+  --spacing-md: 16px;
+  --spacing-lg: 24px;
+  --spacing-xl: 32px;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--dark-bg);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  line-height: 1.6;
+  overflow: hidden;
+}
+
+html, body, #root {
+  height: 100vh;
+  width: 100vw;
+}
+
+/* ========== 应用容器 ========== */
+
+.app-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: linear-gradient(135deg, #1a1a1a 0%, #2d1f1f 100%);
+  border-left: 3px solid var(--primary);
+}
+
+/* 头部 */
+.app-header {
+  background: linear-gradient(90deg, rgba(42, 58, 74, 0.95), rgba(45, 45, 45, 0.95));
+  backdrop-filter: blur(10px);
+  border-bottom: 2px solid var(--primary);
+  padding: var(--spacing-md) var(--spacing-lg);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  
+  animation: slideDown 0.5s ease-out;
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.header-content h1 {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--primary);
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+
+.header-content p {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.clear-btn {
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.3s ease;
+  
+  &:hover {
+    background: rgba(239, 68, 68, 0.25);
+    transform: scale(1.05);
+  }
+  
+  &:active {
+    transform: scale(0.95);
+  }
+}
+
+/* ========== 消息区域 ========== */
+
+.messages-container {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--spacing-lg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+  
+  /* 自定义滚动条 */
+  scrollbar-width: thin;
+  scrollbar-color: var(--primary) var(--card-bg);
+  
+  &::-webkit-scrollbar {
+    width: 8px;
+  }
+  
+  &::-webkit-scrollbar-track {
+    background: var(--card-bg);
+  }
+  
+  &::-webkit-scrollbar-thumb {
+    background: var(--primary);
+    border-radius: 4px;
+    
+    &:hover {
+      background: lighten(var(--primary), 10%);
+    }
+  }
+}
+
+/* 消息包装器 */
+.message-wrapper {
+  display: flex;
+  animation: messageAppear 0.3s ease-out;
+}
+
+@keyframes messageAppear {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.message-user {
+  justify-content: flex-end;
+}
+
+.message-bot {
+  justify-content: flex-start;
+}
+
+/* 消息内容 */
+.message-content {
+  max-width: 75%;
+  padding: var(--spacing-md);
+  border-radius: 12px;
+  position: relative;
+  word-wrap: break-word;
+  
+  /* 代码块样式 */
+  code {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'Courier Prime', monospace;
+    font-size: 13px;
+    color: var(--success);
+  }
+  
+  strong {
+    color: var(--primary);
+    font-weight: 600;
+  }
+  
+  em {
+    color: var(--warning);
+    font-style: italic;
+  }
+}
+
+.message-user {
+  .message-content {
+    background: linear-gradient(135deg, #2a4a3a 0%, #1a3a2a 100%);
+    border: 1px solid rgba(74, 222, 128, 0.2);
+    border-left: 3px solid var(--success);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  }
+}
+
+.message-bot {
+  .message-content {
+    background: linear-gradient(135deg, #2a3a4a 0%, #1a2a3a 100%);
+    border: 1px solid rgba(212, 175, 55, 0.2);
+    border-left: 3px solid var(--primary);
+    box-shadow: 0 4px 12px rgba(212, 175, 55, 0.1);
+  }
+}
+
+/* 用户消息文本 */
+.user-message {
+  color: var(--text-primary);
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+/* 机器人消息文本 */
+.bot-message {
+  color: var(--text-primary);
+  line-height: 1.7;
+  word-break: break-word;
+  
+  /* 特殊样式 */
+  .highlight-bracket {
+    color: var(--primary);
+    font-weight: 500;
+  }
+  
+  /* 列表样式 */
+  ul, ol {
+    margin-left: 20px;
+    margin-top: 8px;
+    
+    li {
+      margin: 4px 0;
+    }
+  }
+  
+  /* 表格样式 */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 8px;
+    font-size: 12px;
+    
+    th, td {
+      border: 1px solid var(--border);
+      padding: 6px;
+      text-align: left;
+    }
+    
+    th {
+      background: rgba(212, 175, 55, 0.1);
+      color: var(--primary);
+      font-weight: 600;
+    }
+    
+    tr:nth-child(even) {
+      background: rgba(0, 0, 0, 0.1);
+    }
+  }
+}
+
+/* 消息时间戳 */
+.message-time {
+  display: block;
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 6px;
+  opacity: 0.7;
+}
+
+/* 消息来源 */
+.message-sources {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(212, 175, 55, 0.1);
+  font-size: 12px;
+  
+  .sources-label {
+    color: var(--primary);
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  
+  .source-tag {
+    display: inline-block;
+    background: rgba(212, 175, 55, 0.15);
+    color: var(--primary);
+    padding: 2px 8px;
+    border-radius: 12px;
+    margin-right: 6px;
+    margin-bottom: 4px;
+    border: 1px solid rgba(212, 175, 55, 0.3);
+    font-weight: 500;
+    cursor: help;
+    
+    &:hover {
+      background: rgba(212, 175, 55, 0.25);
+    }
+  }
+}
+
+/* API 调用标记 */
+.message-apis {
+  margin-top: 6px;
+  font-size: 11px;
+  
+  .api-tag {
+    color: var(--warning);
+    background: rgba(245, 158, 11, 0.1);
+    padding: 2px 6px;
+    border-radius: 4px;
+    display: inline-block;
+  }
+}
+
+/* 意图识别标记 */
+.message-intent {
+  margin-top: 6px;
+  font-size: 11px;
+  
+  .intent-tag {
+    color: var(--success);
+    background: rgba(74, 222, 128, 0.1);
+    padding: 2px 6px;
+    border-radius: 4px;
+    display: inline-block;
+  }
+}
+
+/* 加载动画 */
+.loading {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.typing-indicator {
+  display: flex;
+  gap: 4px;
+  
+  span {
+    width: 8px;
+    height: 8px;
+    background: var(--primary);
+    border-radius: 50%;
+    animation: typing 1.4s infinite;
+    
+    &:nth-child(2) {
+      animation-delay: 0.2s;
+    }
+    
+    &:nth-child(3) {
+      animation-delay: 0.4s;
+    }
+  }
+}
+
+@keyframes typing {
+  0%, 60%, 100% {
+    opacity: 0.5;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-10px);
+  }
+}
+
+/* ========== 输入区域 ========== */
+
+.input-container {
+  background: linear-gradient(180deg, rgba(45, 45, 45, 0.95), rgba(42, 58, 74, 0.95));
+  backdrop-filter: blur(10px);
+  border-top: 2px solid var(--primary);
+  padding: var(--spacing-md) var(--spacing-lg);
+  box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.3);
+}
+
+.input-wrapper {
+  display: flex;
+  gap: var(--spacing-md);
+  margin-bottom: var(--spacing-sm);
+}
+
+.message-input {
+  flex: 1;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: var(--spacing-md);
+  border-radius: 8px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  resize: none;
+  transition: all 0.3s ease;
+  
+  &:focus {
+    outline: none;
+    border-color: var(--primary);
+    background: rgba(212, 175, 55, 0.05);
+    box-shadow: 0 0 0 3px rgba(212, 175, 55, 0.1);
+  }
+  
+  &:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  
+  /* 占位符 */
+  &::placeholder {
+    color: var(--text-secondary);
+  }
+  
+  /* 自定义滚动条 */
+  scrollbar-width: thin;
+  scrollbar-color: var(--primary) rgba(0, 0, 0, 0.3);
+  
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+  
+  &::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.3);
+  }
+  
+  &::-webkit-scrollbar-thumb {
+    background: var(--primary);
+    border-radius: 3px;
+  }
+}
+
+.send-btn {
+  background: linear-gradient(135deg, var(--primary), #c19a1f);
+  border: none;
+  color: #000;
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-radius: 8px;
+  font-weight: 700;
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  box-shadow: 0 4px 12px rgba(212, 175, 55, 0.3);
+  
+  &:hover:not(:disabled) {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(212, 175, 55, 0.4);
+  }
+  
+  &:active:not(:disabled) {
+    transform: translateY(0);
+  }
+  
+  &:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+}
+
+.input-hints {
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: center;
+  
+  span {
+    display: block;
+  }
+}
+
+/* ========== 响应式设计 ========== */
+
+@media (max-width: 768px) {
+  .app-header {
+    padding: var(--spacing-md);
+  }
+  
+  .header-content h1 {
+    font-size: 18px;
+  }
+  
+  .messages-container {
+    padding: var(--spacing-md);
+    gap: var(--spacing-sm);
+  }
+  
+  .message-content {
+    max-width: 90% !important;
+    padding: var(--spacing-sm) var(--spacing-md) !important;
+    font-size: 13px;
+  }
+  
+  .input-container {
+    padding: var(--spacing-md);
+  }
+  
+  .input-wrapper {
+    flex-direction: column;
+  }
+  
+  .send-btn {
+    width: 100%;
+  }
+}
+
+@media (max-width: 480px) {
+  .header-content h1 {
+    font-size: 16px;
+  }
+  
+  .message-content {
+    max-width: 100% !important;
+  }
+}
+
+/* ========== 深色模式优化 ========== */
+
+@media (prefers-color-scheme: dark) {
+  /* 自动使用深色调 */
+}
+
+/* ========== 打印样式 ========== */
+
+@media print {
+  .app-header,
+  .input-container,
+  .clear-btn {
+    display: none;
+  }
+}
