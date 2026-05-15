@@ -1,0 +1,525 @@
+import torch
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertForSequenceClassification, AdamW
+from transformers import get_linear_schedule_with_warmup
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# 第一部分：数据集定义
+# ============================================================================
+
+class TextClassificationDataset(Dataset):
+    """
+    文本分类数据集类
+    用于加载和处理文本分类任务的数据
+    """
+    
+    def __init__(self, texts, labels, tokenizer, max_len=128):
+        """
+        初始化数据集
+        
+        Args:
+            texts (list): 文本列表
+            labels (list): 标签列表
+            tokenizer: BERT分词器
+            max_len (int): 最大序列长度
+        """
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+    
+    def __len__(self):
+        """返回数据集大小"""
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        """
+        获取单个样本
+        
+        Args:
+            idx (int): 样本索引
+            
+        Returns:
+            dict: 包含input_ids、attention_mask和labels的字典
+        """
+        text = self.texts[idx]
+        label = self.labels[idx]
+        
+        # 使用tokenizer对文本进行编码
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,  # 添加[CLS]和[SEP]标签
+            max_length=self.max_len,
+            return_token_type_ids=False,
+            padding='max_length',  # 填充到max_length
+            truncation=True,  # 截断超长文本
+            return_attention_mask=True,  # 返回attention mask
+            return_tensors='pt'  # 返回PyTorch张量
+        )
+        
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+
+# ============================================================================
+# 第二部分：模型配置和初始化
+# ============================================================================
+
+class BertForTextClassification:
+    """
+    BERT文本分类模型的包装类
+    负责模型的加载、配置、训练和推理
+    """
+    
+    def __init__(self, model_name='bert-base-chinese', num_classes=2, device='cpu'):
+        """
+        初始化模型
+        
+        Args:
+            model_name (str): HuggingFace模型名称
+            num_classes (int): 分类类别数
+            device (str): 计算设备('cuda'或'cpu')
+        """
+        self.device = device
+        self.model_name = model_name
+        self.num_classes = num_classes
+        
+        # 加载预训练BERT模型和分词器
+        print(f"正在加载 {model_name} 模型...")
+        self.tokenizer = BertTokenizer.from_pretrained(model_name)
+        self.model = BertForSequenceClassification.from_pretrained(
+            model_name,
+            num_labels=num_classes
+        )
+        self.model.to(device)
+        print("模型加载完成！")
+    
+    def configure_optimizer(self, learning_rate=2e-5, weight_decay=0.01):
+        """
+        配置优化器（AdamW）
+        
+        Args:
+            learning_rate (float): 学习率
+            weight_decay (float): 权重衰减
+            
+        Returns:
+            optimizer: 配置好的优化器
+        """
+        # 获取模型参数
+        param_optimizer = list(self.model.named_parameters())
+        
+        # 分离需要衰减和不需要衰减的参数
+        no_decay = ['bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {
+                'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+                'weight_decay': weight_decay
+            },
+            {
+                'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+                'weight_decay': 0.0
+            }
+        ]
+        
+        optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate)
+        return optimizer
+    
+    def train_epoch(self, train_dataloader, optimizer, scheduler):
+        """
+        训练一个epoch
+        
+        Args:
+            train_dataloader: 训练数据加载器
+            optimizer: 优化器
+            scheduler: 学习率调度器
+            
+        Returns:
+            float: 当前epoch的平均损失
+        """
+        self.model.train()
+        total_loss = 0.0
+        
+        for batch in train_dataloader:
+            # 将数据移动到设备上
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
+            labels = batch['labels'].to(self.device)
+            
+            # 清空梯度
+            optimizer.zero_grad()
+            
+            # 前向传播
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+            loss = outputs.loss
+            
+            # 反向传播
+            loss.backward()
+            
+            # 梯度裁剪（防止梯度爆炸）
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            
+            # 优化器步进
+            optimizer.step()
+            scheduler.step()
+            
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(train_dataloader)
+        return avg_loss
+    
+    def evaluate(self, eval_dataloader):
+        """
+        在验证集或测试集上评估模型
+        
+        Args:
+            eval_dataloader: 验证/测试数据加载器
+            
+        Returns:
+            tuple: (平均损失, 准确率, F1分数)
+        """
+        self.model.eval()
+        total_loss = 0.0
+        predictions = []
+        true_labels = []
+        
+        with torch.no_grad():
+            for batch in eval_dataloader:
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+                loss = outputs.loss
+                logits = outputs.logits
+                
+                total_loss += loss.item()
+                
+                # 获取预测结果
+                preds = torch.argmax(logits, dim=1)
+                predictions.extend(preds.cpu().numpy())
+                true_labels.extend(labels.cpu().numpy())
+        
+        avg_loss = total_loss / len(eval_dataloader)
+        accuracy = accuracy_score(true_labels, predictions)
+        f1 = f1_score(true_labels, predictions, average='weighted')
+        
+        return avg_loss, accuracy, f1
+    
+    def train(self, train_dataloader, val_dataloader, epochs=3, learning_rate=2e-5):
+        """
+        完整的训练流程
+        
+        Args:
+            train_dataloader: 训练数据加载器
+            val_dataloader: 验证数据加载器
+            epochs (int): 训练轮次
+            learning_rate (float): 学习率
+        """
+        # 配置优化器和学习率调度器
+        optimizer = self.configure_optimizer(learning_rate=learning_rate)
+        
+        # 计算总训练步数
+        total_steps = len(train_dataloader) * epochs
+        
+        # 配置学习率预热和线性衰减调度
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=0,
+            num_training_steps=total_steps
+        )
+        
+        print(f"\n开始训练 {epochs} 个epoch...")
+        print("=" * 80)
+        
+        for epoch in range(epochs):
+            print(f"\nEpoch {epoch + 1}/{epochs}")
+            print("-" * 80)
+            
+            # 训练
+            train_loss = self.train_epoch(train_dataloader, optimizer, scheduler)
+            print(f"训练损失: {train_loss:.4f}")
+            
+< truncated lines 268-451 >
+                dataset = load_dataset('imdb', split=split)
+                texts = [item['text'] for item in dataset]
+                labels = [item['label'] for item in dataset]
+                
+            elif dataset_name == 'yelp_review_full':
+                dataset = load_dataset('yelp_review_full', split=split)
+                texts = [item['text'] for item in dataset]
+                labels = [item['label'] for item in dataset]
+                
+            elif dataset_name == 'ag_news':
+                dataset = load_dataset('ag_news', split=split)
+                texts = [item['text'] for item in dataset]
+                labels = [item['label'] for item in dataset]
+                
+            else:
+                print(f"未知的数据集: {dataset_name}")
+                return None, None
+        
+        print(f"成功加载数据集！样本数: {len(texts)}")
+        return texts, labels
+        
+    except Exception as e:
+        print(f"加载数据集失败: {e}")
+        return None, None
+
+
+def prepare_huggingface_data(dataset_name='imdb', use_chinese=False, max_samples=None):
+    """
+    从 HuggingFace 准备数据集并划分
+    
+    Args:
+        dataset_name (str): 数据集名称
+        use_chinese (bool): 是否使用中文数据集
+        max_samples (int): 最大样本数（用于快速测试）
+        
+    Returns:
+        tuple: (训练文本, 训练标签, 验证文本, 验证标签, 测试文本, 测试标签)
+    """
+    
+    # 加载训练数据
+    train_texts, train_labels = load_huggingface_dataset(
+        dataset_name=dataset_name,
+        split='train',
+        use_chinese=use_chinese
+    )
+    
+    if train_texts is None:
+        print("加载数据失败，使用样本数据代替")
+        return generate_sample_data()
+    
+    # 限制样本数（用于快速测试）
+    if max_samples is not None:
+        train_texts = train_texts[:max_samples]
+        train_labels = train_labels[:max_samples]
+    
+    # 尝试加载测试数据
+    test_texts, test_labels = load_huggingface_dataset(
+        dataset_name=dataset_name,
+        split='test',
+        use_chinese=use_chinese
+    )
+    
+    # 如果没有测试数据，则从训练数据划分
+    if test_texts is None:
+        print("未找到测试数据，从训练数据划分")
+        test_texts = None
+    
+    # 划分训练集、验证集、测试集
+    # 如果有测试集，则将训练数据按 7:1 划分为训练和验证
+    # 否则按 6:2:2 划分
+    
+    if test_texts is None:
+        # 按 6:2:2 划分
+        total_size = len(train_texts)
+        train_size = int(total_size * 0.6)
+        val_size = int(total_size * 0.2)
+        
+        final_train_texts = train_texts[:train_size]
+        final_train_labels = train_labels[:train_size]
+        
+        final_val_texts = train_texts[train_size:train_size + val_size]
+        final_val_labels = train_labels[train_size:train_size + val_size]
+        
+        final_test_texts = train_texts[train_size + val_size:]
+        final_test_labels = train_labels[train_size + val_size:]
+    else:
+        # 使用独立的测试集
+        total_size = len(train_texts)
+        train_size = int(total_size * 0.85)
+        
+        final_train_texts = train_texts[:train_size]
+        final_train_labels = train_labels[:train_size]
+        
+        final_val_texts = train_texts[train_size:]
+        final_val_labels = train_labels[train_size:]
+        
+        final_test_texts = test_texts
+        final_test_labels = test_labels
+    
+    print(f"\n数据集划分:")
+    print(f"  训练集: {len(final_train_texts)} 个样本")
+    print(f"  验证集: {len(final_val_texts)} 个样本")
+    print(f"  测试集: {len(final_test_texts)} 个样本")
+    
+    return (final_train_texts, final_train_labels, 
+            final_val_texts, final_val_labels, 
+            final_test_texts, final_test_labels)
+
+
+# ============================================================================
+# 第四部分：主程序
+# ============================================================================
+
+def main(use_huggingface=False, dataset_name='imdb', use_chinese=False, max_samples=None):
+    """
+    主程序：完整的BERT微调流程
+    
+    Args:
+        use_huggingface (bool): 是否使用 HuggingFace 数据集
+        dataset_name (str): 数据集名称（如果使用HF数据集）
+        use_chinese (bool): 是否使用中文数据集
+        max_samples (int): 最大样本数（用于快速测试）
+    
+    使用 HuggingFace 数据集的示例：
+    
+    # 英文数据集
+    main(use_huggingface=True, dataset_name='imdb')
+    main(use_huggingface=True, dataset_name='imdb', max_samples=1000)
+    
+    # 中文数据集
+    main(use_huggingface=True, dataset_name='clue', use_chinese=True)
+    
+    # 使用样本数据
+    main(use_huggingface=False)
+    """
+    
+    print("=" * 80)
+    print("BERT 文本分类微调实验")
+    print("=" * 80)
+    
+    # 1. 设备配置
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\n使用设备: {device}")
+    
+    # 2. 加载预训练模型和分词器
+    print("\n[步骤1] 加载预训练模型")
+    # 根据是否使用中文数据集选择模型
+    model_name = 'bert-base-chinese' if use_chinese else 'bert-base-uncased'
+    
+    model_wrapper = BertForTextClassification(
+        model_name=model_name,
+        num_classes=2,  # 二分类：正面(1)和负面(0)
+        device=device
+    )
+    
+    # 3. 准备数据集
+    print("\n[步骤2] 准备数据集")
+    if use_huggingface:
+        print(f"使用 HuggingFace 数据集: {dataset_name}")
+        train_texts, train_labels, val_texts, val_labels, test_texts, test_labels = prepare_huggingface_data(
+            dataset_name=dataset_name,
+            use_chinese=use_chinese,
+            max_samples=max_samples
+        )
+    else:
+        print("使用本地样本数据集")
+        train_texts, train_labels, val_texts, val_labels, test_texts, test_labels = generate_sample_data()
+    
+    print(f"训练集大小: {len(train_texts)}")
+    print(f"验证集大小: {len(val_texts)}")
+    print(f"测试集大小: {len(test_texts)}")
+    
+    # 显示数据样本
+    print("\n数据样本示例:")
+    print(f"  文本: {train_texts[0][:60]}...")
+    print(f"  标签: {train_labels[0]}")
+    
+    # 4. 创建数据加载器
+    print("\n[步骤3] 创建数据加载器")
+    batch_size = 16
+    
+    train_dataset = TextClassificationDataset(
+        train_texts, train_labels, model_wrapper.tokenizer
+    )
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    
+    val_dataset = TextClassificationDataset(
+        val_texts, val_labels, model_wrapper.tokenizer
+    )
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size)
+    
+    test_dataset = TextClassificationDataset(
+        test_texts, test_labels, model_wrapper.tokenizer
+    )
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
+    
+    # 5. 微调训练
+    print("\n[步骤4] 微调训练")
+    model_wrapper.train(
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        epochs=3,
+        learning_rate=2e-5
+    )
+    
+    # 6. 测试集评估
+    print("\n[步骤5] 在测试集上评估模型")
+    test_loss, test_accuracy, test_f1 = model_wrapper.evaluate(test_dataloader)
+    print(f"\n测试集结果:")
+    print(f"  损失: {test_loss:.4f}")
+    print(f"  准确率: {test_accuracy:.4f}")
+    print(f"  F1分数: {test_f1:.4f}")
+    
+    # 7. 预测推理
+    print("\n[步骤6] 使用微调后的模型进行预测")
+    test_samples = [
+        "这个产品质量非常好，我非常满意！",
+        "服务太差了，不推荐购买。",
+        "价格合理，做工精细，值得购买。",
+    ]
+    
+    predictions = model_wrapper.predict(test_samples)
+    labels_map = {0: "负面评价", 1: "正面评价"}
+    
+    print("\n预测结果:")
+    for text, pred in zip(test_samples, predictions):
+        print(f"  文本: {text}")
+        print(f"  预测: {labels_map[pred]}\n")
+    
+    # 8. 保存模型
+    print("[步骤7] 保存微调后的模型")
+    save_path = './bert_finetuned_model'
+    model_wrapper.save_model(save_path)
+    
+    # 9. 加载模型（演示模型复用）
+    print("\n[步骤8] 演示模型加载与复用")
+    new_model = BertForTextClassification(model_name=model_name, device=device)
+    new_model.load_model(save_path)
+    
+    # 用加载的模型进行预测
+    new_predictions = new_model.predict(test_samples)
+    print("\n用加载的模型进行预测:")
+    for text, pred in zip(test_samples, new_predictions):
+        print(f"  文本: {text}")
+        print(f"  预测: {labels_map[pred]}\n")
+    
+    print("=" * 80)
+    print("实验完成！")
+    print("=" * 80)
+
+
+if __name__ == '__main__':
+    # ========================================================================
+    # 使用示例：
+    # ========================================================================
+    
+    # 示例 1: 使用本地样本数据（默认）
+    # main(use_huggingface=False)
+    
+    # 示例 2: 使用 HuggingFace IMDB 数据集（英文电影评论）
+    # main(use_huggingface=True, dataset_name='imdb', max_samples=1000)
+    
+    # 示例 3: 使用中文数据集
+    # main(use_huggingface=True, dataset_name='clue', use_chinese=True, max_samples=1000)
+    
+    # 默认：使用本地样本数据
+    main(use_huggingface=False)
