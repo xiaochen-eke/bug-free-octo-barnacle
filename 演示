@@ -1,0 +1,332 @@
+"""
+完整的Transformer机器翻译项目示例
+包含: 数据准备、模型训练、模型评估、翻译演示
+"""
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import json
+import random
+from pathlib import Path
+
+# 导入项目模块
+from model import Transformer
+from data import VocabBuilder, Tokenizer, TranslationDataset, create_dataloaders
+from train import Trainer, BLEU
+from inference import Translator
+
+
+def load_sample_data():
+    """
+    加载样本数据 (中英翻译对)
+    在实际项目中，这些数据应该来自真实的翻译语料库
+    """
+    # 中英翻译对 (简单示例)
+    data = [
+        ("你好", "Hello"),
+        ("早上好", "Good morning"),
+        ("谢谢", "Thank you"),
+        ("对不起", "Sorry"),
+        ("没问题", "No problem"),
+        ("你好吗", "How are you"),
+        ("很好", "Very well"),
+        ("我是学生", "I am a student"),
+        ("这是一本书", "This is a book"),
+        ("今天天气很好", "The weather is nice today"),
+        ("我喜欢阅读", "I like reading"),
+        ("他住在北京", "He lives in Beijing"),
+        ("你想喝茶吗", "Would you like some tea"),
+        ("我很高兴", "I am very happy"),
+        ("晚安", "Good night"),
+        ("见你很高兴", "Nice to meet you"),
+        ("这件衣服多少钱", "How much is this dress"),
+        ("你叫什么名字", "What is your name"),
+        ("我很累", "I am tired"),
+        ("让我帮你", "Let me help you"),
+    ]
+    
+    src_texts = [d[0] for d in data]
+    tgt_texts = [d[1] for d in data]
+    
+    return src_texts, tgt_texts
+
+
+def build_vocabulary(src_texts, tgt_texts, min_freq=1):
+    """
+    构建词汇表
+    
+    参数:
+        src_texts: 源语言文本列表
+        tgt_texts: 目标语言文本列表
+        min_freq: 最小频率
+    
+    返回:
+        (源语言分词器, 目标语言分词器)
+    """
+    print("构建词汇表...")
+    
+    # 为中文文本构建词汇表
+    src_builder = VocabBuilder(min_freq=min_freq)
+    src_vocab = src_builder.build_vocab(src_texts, lambda x: list(x))
+    
+    # 为英文文本构建词汇表
+    tgt_builder = VocabBuilder(min_freq=min_freq)
+    tgt_vocab = tgt_builder.build_vocab(tgt_texts, lambda x: x.lower().split())
+    
+    # 创建分词器
+    src_tokenizer = Tokenizer(src_vocab)
+    tgt_tokenizer = Tokenizer(tgt_vocab)
+    
+    print(f"源语言词汇表大小: {src_tokenizer.get_vocab_size()}")
+    print(f"目标语言词汇表大小: {tgt_tokenizer.get_vocab_size()}")
+    
+    return src_tokenizer, tgt_tokenizer
+
+
+def create_model(src_vocab_size, tgt_vocab_size, device='cpu'):
+    """
+    创建Transformer模型
+    
+    参数:
+        src_vocab_size: 源词汇表大小
+        tgt_vocab_size: 目标词汇表大小
+        device: 设备
+    
+    返回:
+        模型
+    """
+    print("创建模型...")
+    
+    # 模型配置
+    config = {
+        'src_vocab_size': src_vocab_size,
+        'tgt_vocab_size': tgt_vocab_size,
+        'd_model': 256,          # 模型维度
+        'num_heads': 4,          # 注意力头数
+        'd_ff': 1024,           # 前馈网络维度
+        'num_layers': 2,        # 编码器/解码器层数
+        'max_seq_length': 100,  # 最大序列长度
+        'dropout': 0.1,
+        'padding_idx': 0
+    }
+    
+    model = Transformer(**config)
+    
+    # 计算参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"模型参数总数: {total_params:,}")
+    print(f"可训练参数数: {trainable_params:,}")
+    
+    return model.to(device)
+
+
+def train_model(model, train_loader, val_loader, device='cpu', num_epochs=50):
+    """
+    训练模型
+    
+    参数:
+        model: 模型
+        train_loader: 训练数据加载器
+        val_loader: 验证数据加载器
+        device: 设备
+        num_epochs: 训练轮数
+    
+    返回:
+        训练历史
+    """
+    print("开始训练...")
+    
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        lr=0.0005,
+        warmup_steps=100,
+        num_epochs=num_epochs,
+        gradient_clip=1.0,
+        patience=10
+    )
+    
+    history = trainer.train()
+    
+    return history, trainer
+
+
+def evaluate_model(model, test_loader, device='cpu'):
+    """
+    评估模型
+    
+    参数:
+        model: 模型
+        test_loader: 测试数据加载器
+        device: 设备
+    
+    返回:
+        测试损失
+    """
+    print("评估模型...")
+    
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    
+    from train import LabelSmoothingLoss
+    loss_fn = LabelSmoothingLoss(
+        vocab_size=model.linear.out_features,
+        smoothing=0.1,
+        padding_idx=0
+    )
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            src = batch['src'].to(device)
+            tgt = batch['tgt'].to(device)
+            labels = batch['label'].to(device)
+            
+            logits = model(src, tgt)
+            loss = loss_fn(logits, labels)
+            
+            batch_size = src.size(0)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+    
+    avg_loss = total_loss / total_samples
+    print(f"测试损失: {avg_loss:.4f}")
+    
+    return avg_loss
+
+
+def demonstrate_translation(model, src_tokenizer, tgt_tokenizer, device='cpu'):
+    """
+    演示翻译功能
+    
+    参数:
+        model: 训练好的模型
+        src_tokenizer: 源语言分词器
+        tgt_tokenizer: 目标语言分词器
+        device: 设备
+    """
+    print("\n翻译演示")
+    print("=" * 50)
+    
+    translator = Translator(
+        model=model,
+        src_tokenizer=src_tokenizer,
+        tgt_tokenizer=tgt_tokenizer,
+        device=device,
+        max_length=50,
+        beam_width=5
+    )
+    
+    # 测试句子
+    test_sentences = [
+        "你好",
+        "谢谢",
+        "今天天气很好",
+        "我很高兴",
+        "你叫什么名字"
+    ]
+    
+    print("\n使用贪心解码:")
+    for src_text in test_sentences:
+        translation = translator.translate(src_text, method='greedy')
+        print(f"源文本: {src_text}")
+        print(f"翻译:   {translation}")
+        print()
+
+
+def main():
+    """主程序"""
+    
+    # 设置随机种子
+    torch.manual_seed(42)
+    random.seed(42)
+    
+    # 检查GPU可用性
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}\n")
+    
+    # 1. 加载数据
+    print("步骤 1: 加载数据")
+    print("-" * 50)
+    src_texts, tgt_texts = load_sample_data()
+    print(f"加载了 {len(src_texts)} 个翻译对\n")
+    
+    # 2. 构建词汇表
+    print("步骤 2: 构建词汇表")
+    print("-" * 50)
+    src_tokenizer, tgt_tokenizer = build_vocabulary(src_texts, tgt_texts)
+    print()
+    
+    # 3. 创建数据加载器
+    print("步骤 3: 创建数据加载器")
+    print("-" * 50)
+    train_loader, val_loader, test_loader = create_dataloaders(
+        src_texts=src_texts,
+        tgt_texts=tgt_texts,
+        src_tokenizer=src_tokenizer,
+        tgt_tokenizer=tgt_tokenizer,
+        batch_size=4,
+        max_length=50,
+        train_ratio=0.7,
+        val_ratio=0.15,
+        shuffle=True
+    )
+    print(f"训练集批次数: {len(train_loader)}")
+    print(f"验证集批次数: {len(val_loader)}")
+    print(f"测试集批次数: {len(test_loader)}\n")
+    
+    # 4. 创建模型
+    print("步骤 4: 创建模型")
+    print("-" * 50)
+    model = create_model(
+        src_vocab_size=src_tokenizer.get_vocab_size(),
+        tgt_vocab_size=tgt_tokenizer.get_vocab_size(),
+        device=device
+    )
+    print()
+    
+    # 5. 训练模型
+    print("步骤 5: 训练模型")
+    print("-" * 50)
+    history, trainer = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        num_epochs=30
+    )
+    print()
+    
+    # 6. 评估模型
+    print("步骤 6: 评估模型")
+    print("-" * 50)
+    evaluate_model(model, test_loader, device=device)
+    print()
+    
+    # 7. 演示翻译
+    print("步骤 7: 翻译演示")
+    print("-" * 50)
+    demonstrate_translation(model, src_tokenizer, tgt_tokenizer, device=device)
+    
+    # 8. 保存模型和分词器
+    print("步骤 8: 保存模型")
+    print("-" * 50)
+    torch.save(model.state_dict(), 'transformer_mt_model.pth')
+    print("模型已保存到 'transformer_mt_model.pth'\n")
+    
+    # 保存分词器
+    from data import save_tokenizers
+    save_tokenizers(src_tokenizer, tgt_tokenizer, 'tokenizers')
+    print("分词器已保存到 'tokenizers_src.json' 和 'tokenizers_tgt.json'\n")
+    
+    print("=" * 50)
+    print("项目完成!")
+    print("=" * 50)
+
+
+if __name__ == '__main__':
+    main()
