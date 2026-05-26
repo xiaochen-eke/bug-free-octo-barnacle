@@ -1,0 +1,395 @@
+"""
+训练和评估模块 - 包含训练循环、损失计算、BLEU评分等
+"""
+
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR
+from typing import Dict, Tuple, List
+import numpy as np
+from collections import defaultdict
+
+
+class LabelSmoothingLoss(nn.Module):
+    """标签平滑损失函数 - 防止模型过度自信"""
+    
+    def __init__(self, vocab_size, smoothing=0.1, padding_idx=0):
+        """
+        初始化标签平滑损失
+        
+        参数:
+            vocab_size: 词汇表大小
+            smoothing: 平滑系数 (0-1)
+            padding_idx: 填充token索引
+        """
+        super(LabelSmoothingLoss, self).__init__()
+        self.vocab_size = vocab_size
+        self.padding_idx = padding_idx
+        self.smoothing = smoothing
+        self.confidence = 1.0 - smoothing
+    
+    def forward(self, logits, targets):
+        """
+        计算标签平滑损失
+        
+        参数:
+            logits: 模型输出 [batch_size, seq_len, vocab_size]
+            targets: 目标标签 [batch_size, seq_len]
+        
+        返回:
+            平均损失
+        """
+        # 计算log softmax
+        log_probs = torch.log_softmax(logits, dim=-1)
+        
+        # 创建平滑的目标分布
+        smooth_targets = torch.zeros_like(log_probs)
+        smooth_targets.fill_(self.smoothing / (self.vocab_size - 1))
+        
+        # 将真实标签的概率设为confidence
+        smooth_targets.scatter_(2, targets.unsqueeze(2), self.confidence)
+        
+        # 计算KL散度损失
+        loss = -(smooth_targets * log_probs).sum(dim=-1)
+        
+        # 忽略填充token的损失
+        mask = (targets != self.padding_idx).float()
+        loss = loss * mask
+        
+        return loss.sum() / mask.sum()
+
+
+def get_lr_scheduler(optimizer, d_model=512, warmup_steps=4000):
+    """
+    获取学习率调度器 - 使用预热(warmup)策略
+    
+    参数:
+        optimizer: 优化器
+        d_model: 模型维度
+        warmup_steps: 预热步数
+    
+    返回:
+        学习率调度器
+    """
+    def lr_lambda(current_step):
+        """
+        学习率调度函数
+        
+        lr = 1 / sqrt(d_model) * min(1/sqrt(step), step/warmup_steps^1.5)
+        """
+        if current_step == 0:
+            current_step = 1
+        return min(1.0 / math.sqrt(current_step),
+                   current_step * (warmup_steps ** -1.5)) / math.sqrt(d_model)
+    
+    return LambdaLR(optimizer, lr_lambda)
+
+
+class Trainer:
+    """训练器 - 管理模型训练过程"""
+    
+    def __init__(self, model, train_loader, val_loader, device='cpu',
+                 lr=1e-4, warmup_steps=4000, num_epochs=50, 
+                 gradient_clip=1.0, patience=10):
+        """
+        初始化训练器
+        
+        参数:
+            model: Transformer模型
+            train_loader: 训练数据加载器
+            val_loader: 验证数据加载器
+            device: 设备 (cpu/cuda)
+            lr: 初始学习率
+            warmup_steps: 预热步数
+            num_epochs: 训练轮数
+            gradient_clip: 梯度裁剪值
+            patience: 早停耐心值 (多少个epoch无改进后停止)
+        """
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.device = device
+        self.num_epochs = num_epochs
+        self.gradient_clip = gradient_clip
+        self.patience = patience
+        
+        # 优化器和学习率调度
+        self.optimizer = optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.98))
+        self.scheduler = get_lr_scheduler(self.optimizer, warmup_steps=warmup_steps)
+        
+        # 损失函数
+        padding_idx = 0  # 假设填充token索引为0
+        self.loss_fn = LabelSmoothingLoss(
+            vocab_size=model.linear.out_features,
+            smoothing=0.1,
+            padding_idx=padding_idx
+        )
+        
+        # 训练历史
+        self.train_losses = []
+        self.val_losses = []
+        self.val_bleu_scores = []
+        self.best_val_loss = float('inf')
+        self.best_epoch = 0
+        self.epochs_without_improvement = 0
+    
+    def train_epoch(self) -> float:
+        """
+        训练一个epoch
+        
+        返回:
+            平均训练损失
+        """
+        self.model.train()
+        total_loss = 0.0
+        total_samples = 0
+        
+        for batch in self.train_loader:
+            # 移动数据到设备
+            src = batch['src'].to(self.device)
+            tgt = batch['tgt'].to(self.device)
+            labels = batch['label'].to(self.device)
+            
+            # 前向传播
+            self.optimizer.zero_grad()
+            logits = self.model(src, tgt)
+            
+            # 计算损失
+            loss = self.loss_fn(logits, labels)
+            
+            # 反向传播
+            loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+            
+            # 优化步骤
+            self.optimizer.step()
+            self.scheduler.step()
+            
+            # 累积损失
+            batch_size = src.size(0)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+        
+        avg_loss = total_loss / total_samples
+        return avg_loss
+    
+    def validate(self) -> Tuple[float, float]:
+        """
+        在验证集上评估模型
+        
+        返回:
+            (平均验证损失, BLEU分数)
+        """
+        self.model.eval()
+        total_loss = 0.0
+        total_samples = 0
+        
+        with torch.no_grad():
+            for batch in self.val_loader:
+                src = batch['src'].to(self.device)
+                tgt = batch['tgt'].to(self.device)
+                labels = batch['label'].to(self.device)
+                
+                # 前向传播
+                logits = self.model(src, tgt)
+                
+                # 计算损失
+                loss = self.loss_fn(logits, labels)
+                
+                # 累积损失
+                batch_size = src.size(0)
+                total_loss += loss.item() * batch_size
+                total_samples += batch_size
+        
+        avg_loss = total_loss / total_samples
+        
+        # 计算BLEU分数 (简化版本)
+        bleu_score = self.compute_bleu_on_validation()
+        
+        return avg_loss, bleu_score
+    
+    def compute_bleu_on_validation(self) -> float:
+        """
+        计算验证集上的BLEU分数 (简化版本)
+        
+        返回:
+            BLEU分数 (0-100)
+        """
+        # 这是一个简化的BLEU计算
+        # 真实场景应该使用nltk或sacrebleu库
+        return 0.0  # 占位符
+    
+    def train(self) -> Dict:
+        """
+        训练模型
+        
+        返回:
+            训练历史字典
+        """
+        print("开始训练模型...")
+        
+        for epoch in range(self.num_epochs):
+            # 训练阶段
+            train_loss = self.train_epoch()
+            self.train_losses.append(train_loss)
+            
+            # 验证阶段
+            val_loss, bleu_score = self.validate()
+            self.val_losses.append(val_loss)
+            self.val_bleu_scores.append(bleu_score)
+            
+            print(f"Epoch {epoch+1}/{self.num_epochs} - "
+                  f"Train Loss: {train_loss:.4f}, "
+                  f"Val Loss: {val_loss:.4f}, "
+                  f"BLEU: {bleu_score:.4f}")
+            
+            # 早停判断
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.best_epoch = epoch
+                self.epochs_without_improvement = 0
+                
+                # 保存最好的模型
+                self.save_checkpoint(f'best_model.pt')
+            else:
+                self.epochs_without_improvement += 1
+                if self.epochs_without_improvement >= self.patience:
+                    print(f"早停: {self.patience}个epoch无改进")
+                    break
+        
+        print("训练完成!")
+        
+        return {
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'val_bleu_scores': self.val_bleu_scores,
+            'best_epoch': self.best_epoch,
+            'best_val_loss': self.best_val_loss
+        }
+    
+    def save_checkpoint(self, path: str):
+        """
+        保存检查点
+        
+        参数:
+            path: 保存路径
+        """
+        checkpoint = {
+            'epoch': self.best_epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_val_loss': self.best_val_loss,
+        }
+        torch.save(checkpoint, path)
+        print(f"检查点已保存到 {path}")
+    
+    def load_checkpoint(self, path: str):
+        """
+        加载检查点
+        
+        参数:
+            path: 加载路径
+        """
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.best_epoch = checkpoint['epoch']
+        self.best_val_loss = checkpoint['best_val_loss']
+        print(f"检查点已加载，最佳epoch: {self.best_epoch}, 最佳损失: {self.best_val_loss:.4f}")
+
+
+class BLEU:
+    """BLEU分数计算器"""
+    
+    def __init__(self, n=4):
+        """
+        初始化BLEU计算器
+        
+        参数:
+            n: n-gram的最大值 (通常为4)
+        """
+        self.n = n
+    
+    def compute_bleu(self, reference: List[str], hypothesis: List[str]) -> float:
+        """
+        计算单句BLEU分数
+        
+        参数:
+            reference: 参考译文词元列表
+            hypothesis: 假设译文词元列表
+        
+        返回:
+            BLEU分数 (0-100)
+        """
+        from collections import Counter
+        
+        # 计算n-gram匹配
+        score = 0.0
+        weights = [0.25] * self.n  # 均匀权重
+        
+        for i in range(1, self.n + 1):
+            # 生成n-gram
+            ref_ngrams = self._get_ngrams(reference, i)
+            hyp_ngrams = self._get_ngrams(hypothesis, i)
+            
+            # 计算匹配数
+            matches = 0
+            for ngram in hyp_ngrams:
+                matches += min(hyp_ngrams[ngram], ref_ngrams.get(ngram, 0))
+            
+            # 计算精度
+            if len(hyp_ngrams) > 0:
+                precision = matches / len(hyp_ngrams)
+            else:
+                precision = 0.0
+            
+            score += weights[i-1] * math.log(precision + 1e-16)
+        
+        # 简明性惩罚
+        if len(hypothesis) < len(reference):
+            bp = math.exp(1 - len(reference) / len(hypothesis))
+        else:
+            bp = 1.0
+        
+        bleu = bp * math.exp(score)
+        return bleu * 100
+    
+    def _get_ngrams(self, tokens: List[str], n: int):
+        """
+        生成n-gram
+        
+        参数:
+            tokens: 词元列表
+            n: n-gram大小
+        
+        返回:
+            n-gram计数字典
+        """
+        ngrams = defaultdict(int)
+        for i in range(len(tokens) - n + 1):
+            ngram = tuple(tokens[i:i+n])
+            ngrams[ngram] += 1
+        return ngrams
+    
+    def corpus_bleu(self, references: List[List[str]], 
+                    hypotheses: List[List[str]]) -> float:
+        """
+        计算语料库BLEU分数
+        
+        参数:
+            references: 参考译文列表 (每个是词元列表)
+            hypotheses: 假设译文列表 (每个是词元列表)
+        
+        返回:
+            BLEU分数 (0-100)
+        """
+        score = 0.0
+        for ref, hyp in zip(references, hypotheses):
+            score += self.compute_bleu(ref, hyp)
+        return score / len(references)
