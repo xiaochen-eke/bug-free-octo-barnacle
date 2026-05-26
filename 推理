@@ -1,0 +1,287 @@
+"""
+推理和解码模块 - 包含贪心解码、束搜索等翻译生成策略
+"""
+
+import torch
+import torch.nn.functional as F
+from typing import List, Tuple
+import math
+
+
+class Translator:
+    """翻译器 - 使用训练好的模型进行翻译"""
+    
+    def __init__(self, model, src_tokenizer, tgt_tokenizer, device='cpu',
+                 max_length=100, beam_width=5):
+        """
+        初始化翻译器
+        
+        参数:
+            model: 训练好的Transformer模型
+            src_tokenizer: 源语言分词器
+            tgt_tokenizer: 目标语言分词器
+            device: 设备 (cpu/cuda)
+            max_length: 生成的最大长度
+            beam_width: 束搜索的宽度
+        """
+        self.model = model.to(device)
+        self.model.eval()
+        self.src_tokenizer = src_tokenizer
+        self.tgt_tokenizer = tgt_tokenizer
+        self.device = device
+        self.max_length = max_length
+        self.beam_width = beam_width
+        
+        # 获取特殊token索引
+        self.bos_idx = tgt_tokenizer.vocab_dict.get('<bos>', 1)
+        self.eos_idx = tgt_tokenizer.vocab_dict.get('<eos>', 2)
+        self.pad_idx = tgt_tokenizer.vocab_dict.get('<pad>', 0)
+        self.unk_idx = tgt_tokenizer.vocab_dict.get('<unk>', 3)
+    
+    def translate_greedy(self, src_text: str) -> str:
+        """
+        使用贪心解码进行翻译 - 每一步选择概率最高的token
+        
+        参数:
+            src_text: 源语言文本
+        
+        返回:
+            目标语言翻译文本
+        """
+        with torch.no_grad():
+            # 编码源文本
+            src_indices = self.src_tokenizer.encode(src_text, add_bos=False, add_eos=True)
+            src_tensor = torch.tensor([src_indices], dtype=torch.long).to(self.device)
+            
+            # 获取编码器输出
+            encoder_output = self.model.encoder(src_tensor, None)
+            
+            # 初始化解码器输入 (起始token)
+            tgt_indices = [self.bos_idx]
+            
+            # 逐步生成目标序列
+            for _ in range(self.max_length):
+                # 创建当前目标序列张量
+                tgt_tensor = torch.tensor([tgt_indices], dtype=torch.long).to(self.device)
+                
+                # 解码
+                decoder_output = self.model.decoder(tgt_tensor, encoder_output)
+                
+                # 获取最后一个时间步的输出
+                last_output = decoder_output[:, -1, :]
+                
+                # 投影到词汇表大小
+                logits = self.model.linear(last_output)
+                
+                # 选择概率最高的token (贪心)
+                next_token = torch.argmax(logits, dim=-1).item()
+                
+                tgt_indices.append(next_token)
+                
+                # 如果生成了结束token，停止
+                if next_token == self.eos_idx:
+                    break
+            
+            # 解码目标序列
+            result = self.tgt_tokenizer.decode(tgt_indices)
+        
+        return result
+    
+    def translate_beam_search(self, src_text: str, beam_width: int = None) -> str:
+        """
+        使用束搜索进行翻译 - 在每一步保持多个候选翻译
+        
+        参数:
+            src_text: 源语言文本
+            beam_width: 束搜索宽度 (如果为None, 使用初始化时的值)
+        
+        返回:
+            目标语言翻译文本
+        """
+        if beam_width is None:
+            beam_width = self.beam_width
+        
+        with torch.no_grad():
+            # 编码源文本
+            src_indices = self.src_tokenizer.encode(src_text, add_bos=False, add_eos=True)
+            src_tensor = torch.tensor([src_indices], dtype=torch.long).to(self.device)
+            
+            # 获取编码器输出
+            encoder_output = self.model.encoder(src_tensor, None)
+            batch_size = encoder_output.size(0)
+            
+            # 展开encoder_output用于束搜索
+            encoder_output = encoder_output.repeat_interleave(beam_width, dim=0)
+            
+            # 初始化束 (候选翻译)
+            # 每个束包含: (序列索引, 累积得分)
+            sequences = torch.full((batch_size * beam_width, 1), 
+                                   self.bos_idx, dtype=torch.long).to(self.device)
+            scores = torch.zeros(batch_size * beam_width).to(self.device)
+            
+            # 束搜索主循环
+            for step in range(self.max_length):
+                # 解码当前序列
+                decoder_output = self.model.decoder(sequences, encoder_output)
+                
+                # 获取最后一个时间步的输出
+                last_output = decoder_output[:, -1, :]
+                logits = self.model.linear(last_output)
+                
+                # 计算log概率
+                log_probs = F.log_softmax(logits, dim=-1)
+                
+                # 将已完成序列的概率设为很小值 (除了EOS token)
+                finished = (sequences[:, -1] == self.eos_idx)
+                for i in range(log_probs.size(1)):
+                    if i != self.eos_idx:
+                        log_probs[finished, i] = -1e9
+                
+                # 计算所有可能的下一步分数
+                vocab_size = log_probs.size(1)
+                next_scores = scores.unsqueeze(1) + log_probs
+                next_scores = next_scores.view(batch_size, -1)
+                
+                # 选择得分最高的beam_width个候选
+                top_scores, top_indices = torch.topk(next_scores, beam_width, dim=-1)
+                
+                # 重建序列
+                beam_indices = top_indices // vocab_size
+                token_indices = top_indices % vocab_size
+                
+                # 收集旧序列
+                sequences = sequences.view(batch_size, beam_width, -1)
+                new_sequences = []
+                new_scores = []
+                
+                for b in range(batch_size):
+                    for k in range(beam_width):
+                        prev_idx = beam_indices[b, k]
+                        prev_seq = sequences[b, prev_idx].clone()
+                        token = token_indices[b, k]
+                        
+                        new_seq = torch.cat([prev_seq, token.unsqueeze(0)])
+                        new_sequences.append(new_seq)
+                        new_scores.append(top_scores[b, k])
+                
+                sequences = torch.stack(new_sequences)
+                scores = torch.stack(new_scores)
+                
+                # 检查是否所有序列都完成
+                all_finished = (sequences[:, -1] == self.eos_idx).all()
+                if all_finished:
+                    break
+            
+            # 从束中选择得分最高的序列
+            best_idx = torch.argmax(scores).item()
+            best_sequence = sequences[best_idx].tolist()
+            
+            # 解码结果
+            result = self.tgt_tokenizer.decode(best_sequence)
+        
+        return result
+    
+    def translate(self, src_text: str, method: str = 'greedy') -> str:
+        """
+        进行翻译
+        
+        参数:
+            src_text: 源语言文本
+            method: 解码方法 ('greedy' 或 'beam_search')
+        
+        返回:
+            目标语言翻译文本
+        """
+        if method == 'greedy':
+            return self.translate_greedy(src_text)
+        elif method == 'beam_search':
+            return self.translate_beam_search(src_text)
+        else:
+            raise ValueError(f"未知的解码方法: {method}")
+    
+    def translate_batch(self, src_texts: List[str], method: str = 'greedy') -> List[str]:
+        """
+        批量翻译
+        
+        参数:
+            src_texts: 源语言文本列表
+            method: 解码方法
+        
+        返回:
+            翻译文本列表
+        """
+        translations = []
+        for src_text in src_texts:
+            translation = self.translate(src_text, method)
+            translations.append(translation)
+        return translations
+
+
+class BeamSearchDecoder:
+    """束搜索解码器 - 高效的束搜索实现"""
+    
+    def __init__(self, model, tgt_vocab_size, bos_idx=1, eos_idx=2, 
+                 pad_idx=0, max_length=100):
+        """
+        初始化束搜索解码器
+        
+        参数:
+            model: Transformer模型
+            tgt_vocab_size: 目标词汇表大小
+            bos_idx: 开始token索引
+            eos_idx: 结束token索引
+            pad_idx: 填充token索引
+            max_length: 最大生成长度
+        """
+        self.model = model
+        self.tgt_vocab_size = tgt_vocab_size
+        self.bos_idx = bos_idx
+        self.eos_idx = eos_idx
+        self.pad_idx = pad_idx
+        self.max_length = max_length
+    
+    def decode(self, encoder_output: torch.Tensor, beam_width: int = 5) -> torch.Tensor:
+        """
+        执行束搜索解码
+        
+        参数:
+            encoder_output: 编码器输出 [batch_size, src_len, d_model]
+            beam_width: 束宽度
+        
+        返回:
+            生成的序列 [batch_size, max_length]
+        """
+        batch_size = encoder_output.size(0)
+        device = encoder_output.device
+        
+        # 初始化
+        sequences = torch.full((batch_size, 1), self.bos_idx, 
+                              dtype=torch.long, device=device)
+        scores = torch.zeros(batch_size, device=device)
+        
+        # 逐步生成
+        for _ in range(self.max_length):
+            # 前向传播
+            decoder_output = self.model.decoder(sequences, encoder_output)
+            
+            # 获取logits
+            logits = self.model.linear(decoder_output[:, -1, :])
+            
+            # 计算log概率
+            log_probs = F.log_softmax(logits, dim=-1)
+            
+            # 更新分数和序列
+            next_scores = scores.unsqueeze(1) + log_probs
+            
+            # 选择最高分的token
+            next_token_scores, next_tokens = torch.max(next_scores, dim=-1)
+            
+            # 更新序列
+            sequences = torch.cat([sequences, next_tokens.unsqueeze(1)], dim=1)
+            scores = next_token_scores
+            
+            # 检查是否完成
+            if (next_tokens == self.eos_idx).all():
+                break
+        
+        return sequences
