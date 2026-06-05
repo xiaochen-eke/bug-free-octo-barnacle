@@ -1,0 +1,184 @@
+import os
+import pandas as pd
+import sentencepiece as spm
+
+# ==================================
+# 路径配置
+# ==================================
+
+DATA_DIR = "../data/processed"
+
+OUTPUT_DIR = "./"
+
+VOCAB_SIZE = 32000
+
+CORPUS_FILE = os.path.join(
+    OUTPUT_DIR,
+    "all_corpus.txt"
+)
+
+MODEL_PREFIX = os.path.join(
+    OUTPUT_DIR,
+    "multilingual"
+)
+
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+# ==================================
+# 收集文本
+# ==================================
+
+def build_corpus():
+
+    print("Building corpus...")
+
+    files = [
+        "train.csv",
+        "valid.csv",
+        "test.csv"
+    ]
+
+    total_lines = 0
+
+    with open(
+        CORPUS_FILE,
+        "w",
+        encoding="utf-8"
+    ) as fout:
+
+        for file_name in files:
+
+            path = os.path.join(
+                DATA_DIR,
+                file_name
+            )
+
+            df = pd.read_csv(path)
+
+            print(
+                f"Processing {file_name}"
+            )
+
+            for _, row in df.iterrows():
+
+                src = str(row["src"])
+                tgt = str(row["tgt"])
+
+                fout.write(src + "\n")
+                fout.write(tgt + "\n")
+
+                total_lines += 2
+
+    print(
+        f"Total lines: {total_lines}"
+    )
+
+# ==================================
+# 训练SentencePiece
+# ==================================
+
+def train_tokenizer():
+
+    print("Training tokenizer...")
+
+    spm.SentencePieceTrainer.train(
+        input=CORPUS_FILE,
+
+        model_prefix=MODEL_PREFIX,
+
+        vocab_size=VOCAB_SIZE,
+
+        model_type="unigram",
+
+        character_coverage=0.9995,
+
+        pad_id=0,
+        unk_id=1,
+        bos_id=2,
+        eos_id=3,
+
+        user_defined_symbols=[
+            "<2zh>",
+            "<2en>",
+            "<2ja>",
+            "<2ko>",
+            "<2fr>"
+        ]
+    )
+
+    print("Tokenizer trained.")
+
+# ==================================
+# 查看词表
+# ==================================
+
+def inspect_tokenizer():
+
+    sp = spm.SentencePieceProcessor()
+
+    sp.load(
+        MODEL_PREFIX + ".model"
+    )
+
+    print()
+
+    print("Vocabulary Size:")
+    print(sp.get_piece_size())
+
+    print()
+
+    print("Special Tokens:")
+
+    for token in [
+        "<2zh>",
+        "<2en>",
+        "<2ja>",
+        "<2ko>",
+        "<2fr>"
+    ]:
+
+        print(
+            token,
+            sp.piece_to_id(token)
+        )
+
+    print()
+
+    sample = "<2fr> Hello world"
+
+    ids = sp.encode(
+        sample,
+        out_type=int
+    )
+
+    pieces = sp.encode(
+        sample,
+        out_type=str
+    )
+
+    print("Sample:")
+    print(sample)
+
+    print("Pieces:")
+    print(pieces)
+
+    print("IDs:")
+    print(ids)
+
+# ==================================
+# 主函数
+# ==================================
+
+def main():
+
+    build_corpus()
+
+    train_tokenizer()
+
+    inspect_tokenizer()
+
+if __name__ == "__main__":
+    main()
