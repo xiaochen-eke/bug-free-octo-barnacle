@@ -1,0 +1,168 @@
+import os
+import json
+import pandas as pd
+from tqdm import tqdm
+
+BASE_DIR = r"C:\DLdata\git\opus-100\opus-100-corpus-v1.0\opus-100-corpus\v1.0\supervised"
+
+OUTPUT_DIR = "../data/processed"
+
+LANG_PAIRS = [
+    ("en", "zh"),
+    ("en", "ja"),
+    ("en", "ko"),
+    ("en", "fr")
+]
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def clean_text(text):
+
+    text = text.strip()
+
+    text = text.replace("\n", " ")
+    text = text.replace("\t", " ")
+
+    text = " ".join(text.split())
+
+    return text
+
+
+def read_parallel(src_file, tgt_file):
+
+    samples = []
+
+    with open(src_file, encoding="utf-8") as fs, \
+         open(tgt_file, encoding="utf-8") as ft:
+
+        for src, tgt in zip(fs, ft):
+
+            src = clean_text(src)
+            tgt = clean_text(tgt)
+
+            if not src or not tgt:
+                continue
+
+            samples.append((src, tgt))
+
+    return samples
+
+
+def build_split(split_name):
+
+    rows = []
+
+    for src_lang, tgt_lang in LANG_PAIRS:
+
+        pair_dir = os.path.join(
+            BASE_DIR,
+            f"{src_lang}-{tgt_lang}"
+        )
+
+        src_file = os.path.join(
+            pair_dir,
+            f"opus.{src_lang}-{tgt_lang}-{split_name}.{src_lang}"
+        )
+
+        tgt_file = os.path.join(
+            pair_dir,
+            f"opus.{src_lang}-{tgt_lang}-{split_name}.{tgt_lang}"
+        )
+
+        print(
+            f"Loading {src_lang}-{tgt_lang} {split_name}"
+        )
+
+        pairs = read_parallel(
+            src_file,
+            tgt_file
+        )
+
+        for src, tgt in tqdm(pairs):
+
+            # en -> xx
+            rows.append({
+                "src": f"<2{tgt_lang}> {src}",
+                "tgt": tgt
+            })
+
+            # xx -> en
+            rows.append({
+                "src": f"<2{src_lang}> {tgt}",
+                "tgt": src
+            })
+
+    return pd.DataFrame(rows)
+
+
+def main():
+
+    print("Building train set...")
+    train_df = build_split("train")
+
+    print("Building valid set...")
+    valid_df = build_split("dev")
+
+    print("Building test set...")
+    test_df = build_split("test")
+
+    train_df.to_csv(
+        os.path.join(
+            OUTPUT_DIR,
+            "train.csv"
+        ),
+        index=False
+    )
+
+    valid_df.to_csv(
+        os.path.join(
+            OUTPUT_DIR,
+            "valid.csv"
+        ),
+        index=False
+    )
+
+    test_df.to_csv(
+        os.path.join(
+            OUTPUT_DIR,
+            "test.csv"
+        ),
+        index=False
+    )
+
+    stats = {
+        "train": len(train_df),
+        "valid": len(valid_df),
+        "test": len(test_df),
+        "languages": [
+            "en",
+            "zh",
+            "ja",
+            "ko",
+            "fr"
+        ]
+    }
+
+    with open(
+        os.path.join(
+            OUTPUT_DIR,
+            "dataset_stats.json"
+        ),
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            stats,
+            f,
+            indent=4,
+            ensure_ascii=False
+        )
+
+    print("\nDone!")
+    print(stats)
+
+
+if __name__ == "__main__":
+    main()
