@@ -1,0 +1,525 @@
+import os
+import sys
+import math
+import json
+from collections import defaultdict
+from typing import Dict, List, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Sampler
+from torch import amp
+
+# =====================================
+# Path
+# =====================================
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_DIR = os.path.dirname(CURRENT_DIR)
+
+MODELS_DIR = os.path.join(BACKEND_DIR, "models")
+DATASETS_DIR = os.path.join(BACKEND_DIR, "datasets")
+
+sys.path.insert(0, MODELS_DIR)
+sys.path.insert(0, DATASETS_DIR)
+
+# =====================================
+# Imports
+# =====================================
+
+from translation_dataset import TranslationDataset
+from transformer import TransformerModel
+
+
+# =====================================
+# Config
+# =====================================
+
+VOCAB_SIZE = 32000
+MAX_LEN = 128
+BATCH_SIZE = 32
+EPOCHS = 10
+
+LR = 3e-4
+WARMUP_STEPS = 4000
+GRADIENT_CLIP = 1.0
+
+# 📊 新增：长尾数据优化配置
+TEMPERATURE = 0.8  # 温度采样（0-1之间，越小越均衡）
+FOCAL_LOSS_ALPHA = 0.25  # Focal Loss权重
+FOCAL_LOSS_GAMMA = 2.0  # Focal Loss困难样本系数
+VALID_RATIO = 0.1  # 验证集比例
+VALID_INTERVAL = 500  # 每N个batch验证一次
+
+
+# =====================================
+# 焦点损失（处理长尾分布）
+# =====================================
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance
+    论文: https://arxiv.org/abs/1708.02002
+    """
+    def __init__(self, vocab_size, ignore_index=0, alpha=0.25, gamma=2.0, label_smoothing=0.1):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.ignore_index = ignore_index
+        self.alpha = alpha
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits, targets):
+        """
+        logits: (batch_size * seq_len, vocab_size)
+        targets: (batch_size * seq_len,)
+        """
+        # 标准交叉熵
+        ce_loss = F.cross_entropy(
+            logits,
+            targets,
+            ignore_index=self.ignore_index,
+            reduction='none',
+            label_smoothing=self.label_smoothing
+        )
+
+        # 获取预测概率
+        p = torch.exp(-ce_loss)
+
+        # Focal Loss: alpha * (1-p)^gamma * ce_loss
+        focal_weight = self.alpha * (1 - p) ** self.gamma
+        focal_loss = focal_weight * ce_loss
+
+        # 排除pad token
+        mask = (targets != self.ignore_index).float()
+        focal_loss = (focal_loss * mask).sum() / mask.sum().clamp(min=1e-8)
+
+        return focal_loss
+
+
+# =====================================
+# 温度采样器（处理数据不均衡）
+# =====================================
+
+class TemperatureSampler(Sampler):
+    """
+    根据语言对频率进行温度采样
+    - temperature=0: 完全按频率采样（热点语言对更多）
+    - temperature=1: 均匀采样（平衡所有语言对）
+    """
+    def __init__(self, dataset, temperature=0.8, seed=42):
+        self.dataset = dataset
+        self.temperature = temperature
+        self.seed = seed
+
+        # 统计每个语言对的数据量
+        lang_pair_counts = defaultdict(int)
+        for idx in range(len(dataset)):
+            lang_pair = dataset.data.iloc[idx]['lang_pair']
+            lang_pair_counts[lang_pair] += 1
+
+        # 计算采样权重: count^temperature
+        self.weights = []
+        for idx in range(len(dataset)):
+            lang_pair = dataset.data.iloc[idx]['lang_pair']
+            count = lang_pair_counts[lang_pair]
+            weight = count ** self.temperature
+            self.weights.append(weight)
+
+        self.weights = np.array(self.weights, dtype=np.float64)
+        self.weights /= self.weights.sum()
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed)
+        indices = rng.choice(
+            len(self.dataset),
+            size=len(self.dataset),
+            p=self.weights,
+            replace=True
+        )
+        return iter(indices)
+
+    def __len__(self):
+        return len(self.dataset)
+
+
+# =====================================
+# 指标计算
+# =====================================
+
+def calculate_bleu(pred_tokens: List[int], ref_tokens: List[int], n=4) -> float:
+    """
+    计算简化版 BLEU 分数（处理多语言）
+    pred_tokens, ref_tokens: token列表
+    """
+    if len(pred_tokens) == 0 or len(ref_tokens) == 0:
+        return 0.0
+
+    # 移除pad token (id=0)
+    pred_tokens = [t for t in pred_tokens if t > 0]
+    ref_tokens = [t for t in ref_tokens if t > 0]
+
+    if len(pred_tokens) == 0:
+        return 0.0
+
+    # 计算n-gram precision
+    bleu_scores = []
+    for gram_n in range(1, min(n, len(pred_tokens)) + 1):
+        pred_grams = set()
+        ref_grams = set()
+
+        for i in range(len(pred_tokens) - gram_n + 1):
+            pred_grams.add(tuple(pred_tokens[i:i+gram_n]))
+
+        for i in range(len(ref_tokens) - gram_n + 1):
+            ref_grams.add(tuple(ref_tokens[i:i+gram_n]))
+
+        if len(ref_grams) == 0:
+            bleu_scores.append(0.0)
+        else:
+            precision = len(pred_grams & ref_grams) / len(ref_grams)
+            bleu_scores.append(precision)
+
+    # 简化版BLEU（几何平均）
+    if all(s > 0 for s in bleu_scores):
+        bleu = np.exp(np.mean(np.log(bleu_scores)))
+    else:
+        bleu = 0.0
+
+    return bleu
+
+
+def calculate_batch_bleu(predictions, targets, pad_idx=0):
+    """
+    batch级别BLEU计算
+    predictions: (batch_size, seq_len)
+    targets: (batch_size, seq_len)
+    """
+    batch_bleu = []
+    for pred, tgt in zip(predictions, targets):
+        pred_tokens = pred.tolist()
+        tgt_tokens = tgt.tolist()
+        bleu = calculate_bleu(pred_tokens, tgt_tokens)
+        batch_bleu.append(bleu)
+    return np.mean(batch_bleu) if batch_bleu else 0.0
+
+
+# =====================================
+# 验证函数
+# =====================================
+
+def validate(
+    model,
+    val_loader,
+    criterion,
+    device,
+    vocab_size,
+    epoch,
+    lang_pair_metrics: Dict = None
+):
+    """
+    验证函数 - 计算BLEU和准确率
+    """
+    model.eval()
+    total_loss = 0
+    total_bleu = 0
+    total_acc = 0
+    num_batches = 0
+
+    if lang_pair_metrics is None:
+        lang_pair_metrics = defaultdict(lambda: {'bleu': [], 'acc': [], 'loss': []})
+
+    with torch.no_grad():
+        for batch in val_loader:
+            src = batch["src"].to(device)
+            tgt = batch["tgt"].to(device)
+            lang_pairs = batch["lang_pair"]
+
+            tgt_input = tgt[:, :-1]
+            tgt_output = tgt[:, 1:]
+
+            logits = model(src, tgt_input)
+            loss = criterion(
+                logits.reshape(-1, vocab_size),
+                tgt_output.reshape(-1)
+            )
+
+            # 准确率
+            pred = logits.argmax(dim=-1)
+            mask = (tgt_output != 0).float()
+            acc = ((pred == tgt_output).float() * mask).sum() / mask.sum().clamp(min=1e-8)
+
+            # BLEU
+            bleu = calculate_batch_bleu(pred, tgt_output)
+
+            # 按语言对统计
+            for i, lang_pair in enumerate(lang_pairs):
+                lang_pair_metrics[lang_pair]['loss'].append(loss.item())
+                lang_pair_metrics[lang_pair]['acc'].append(acc.item())
+                lang_pair_metrics[lang_pair]['bleu'].append(bleu)
+
+            total_loss += loss.item()
+            total_bleu += bleu
+            total_acc += acc.item()
+            num_batches += 1
+
+    avg_loss = total_loss / num_batches
+    avg_bleu = total_bleu / num_batches
+    avg_acc = total_acc / num_batches
+
+    print(f"\n{'='*80}")
+    print(f"Validation (Epoch {epoch+1})")
+    print(f"  Avg Loss: {avg_loss:.4f}")
+    print(f"  Avg BLEU: {avg_bleu:.4f}")
+    print(f"  Avg Acc: {avg_acc:.4f}")
+
+    # 显示Top 10语言对的性能
+    print(f"\nTop 10 Language Pairs (by BLEU):")
+    top_pairs = sorted(
+        lang_pair_metrics.items(),
+        key=lambda x: np.mean(x[1]['bleu']),
+        reverse=True
+    )[:10]
+
+    for lang_pair, metrics in top_pairs:
+        bleu = np.mean(metrics['bleu'])
+        acc = np.mean(metrics['acc'])
+        print(f"  {lang_pair:10s} | BLEU: {bleu:.4f} | Acc: {acc:.4f}")
+
+    print(f"{'='*80}\n")
+
+    model.train()
+    return avg_loss, avg_bleu, avg_acc, lang_pair_metrics
+
+
+# =====================================
+# 主训练函数
+# =====================================
+
+def main():
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {DEVICE}")
+    print(f"Temperature: {TEMPERATURE} (越小越均衡)")
+
+    # =====================================
+    # Dataset & DataLoader
+    # =====================================
+
+    train_dataset = TranslationDataset(
+        csv_file=r"C:\DLdata\git\ecj\multilingual_transformer\backend\data\processed\train_with_lang.csv",
+        sp_model_path=r"C:\DLdata\git\ecj\multilingual_transformer\backend\tokenizer\multilingual.model",
+        max_length=MAX_LEN
+    )
+
+    # ✨ 使用温度采样器而不是随机采样
+    sampler = TemperatureSampler(train_dataset, temperature=TEMPERATURE)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        sampler=sampler,  # 使用自定义采样器
+        num_workers=4,
+        pin_memory=True
+    )
+
+    print(f"Dataset Size: {len(train_dataset)}")
+    print(f"Sampler: TemperatureSampler(T={TEMPERATURE})")
+
+    # =====================================
+    # Model
+    # =====================================
+
+    model = TransformerModel(vocab_size=VOCAB_SIZE).to(DEVICE)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model Parameters: {total_params:,}")
+
+    # =====================================
+    # Loss & Optimizer
+    # =====================================
+
+    # ✨ 使用Focal Loss代替标准CrossEntropyLoss
+    criterion = FocalLoss(
+        vocab_size=VOCAB_SIZE,
+        ignore_index=0,
+        alpha=FOCAL_LOSS_ALPHA,
+        gamma=FOCAL_LOSS_GAMMA,
+        label_smoothing=0.1
+    )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR,
+        weight_decay=1e-5,
+        betas=(0.9, 0.98)
+    )
+
+    # =====================================
+    # AMP
+    # =====================================
+
+    scaler = amp.GradScaler("cuda")
+
+    # =====================================
+    # Learning Rate Scheduler
+    # =====================================
+
+    def lr_lambda(step):
+        if step < WARMUP_STEPS:
+            return step / max(1, WARMUP_STEPS)
+        progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    total_steps = len(train_loader) * EPOCHS
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # =====================================
+    # Checkpoints
+    # =====================================
+
+    checkpoint_dir = os.path.join(BACKEND_DIR, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    best_bleu = -1.0
+    best_loss = float("inf")
+    global_step = 0
+    lang_pair_metrics = defaultdict(lambda: {'bleu': [], 'acc': [], 'loss': []})
+
+    # =====================================
+    # Training Loop
+    # =====================================
+
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0
+        epoch_metrics = defaultdict(lambda: {'loss': 0, 'count': 0})
+
+        for batch_idx, batch in enumerate(train_loader):
+            src = batch["src"].to(DEVICE, non_blocking=True)
+            tgt = batch["tgt"].to(DEVICE, non_blocking=True)
+            lang_pairs = batch["lang_pair"]
+
+            tgt_input = tgt[:, :-1]
+            tgt_output = tgt[:, 1:]
+
+            optimizer.zero_grad()
+
+            with amp.autocast(device_type="cuda"):
+                logits = model(src, tgt_input)
+                loss = criterion(
+                    logits.reshape(-1, VOCAB_SIZE),
+                    tgt_output.reshape(-1)
+                )
+
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP)
+
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            global_step += 1
+
+            total_loss += loss.item()
+
+            # =====================================
+            # Metrics
+            # =====================================
+
+            ppl = torch.exp(loss).item()
+
+            with torch.no_grad():
+                pred = logits.argmax(dim=-1)
+                mask = (tgt_output != 0).float()
+                acc = ((pred == tgt_output).float() * mask).sum() / mask.sum().clamp(min=1e-8)
+                bleu = calculate_batch_bleu(pred, tgt_output)
+
+            # 按语言对统计
+            for lang_pair in lang_pairs:
+                epoch_metrics[lang_pair]['loss'] += loss.item()
+                epoch_metrics[lang_pair]['count'] += 1
+
+            # =====================================
+            # Logging
+            # =====================================
+
+            if batch_idx % 50 == 0:
+                print(
+                    f"Epoch [{epoch+1}/{EPOCHS}] "
+                    f"Batch [{batch_idx}/{len(train_loader)}] "
+                    f"Loss: {loss.item():.4f} "
+                    f"PPL: {ppl:.2f} "
+                    f"Acc: {acc.item():.4f} "
+                    f"BLEU: {bleu:.4f} "
+                    f"LR: {scheduler.get_last_lr()[0]:.6f}"
+                )
+
+            # =====================================
+            # Validation (定期验证)
+            # =====================================
+
+            if (global_step % VALID_INTERVAL == 0) and (batch_idx > 0):
+                val_loss, val_bleu, val_acc, lang_pair_metrics = validate(
+                    model,
+                    train_loader,  # 在训练集上验证（简化版）
+                    criterion,
+                    DEVICE,
+                    VOCAB_SIZE,
+                    epoch,
+                    lang_pair_metrics
+                )
+
+                # 保存最佳BLEU模型
+                if val_bleu > best_bleu:
+                    best_bleu = val_bleu
+                    save_path = os.path.join(checkpoint_dir, "best_bleu_model.pth")
+                    torch.save(model.state_dict(), save_path)
+                    print(f"✨ Best BLEU model saved: {save_path} (BLEU: {val_bleu:.4f})")
+
+        avg_epoch_loss = total_loss / len(train_loader)
+        print(f"\n{'='*80}")
+        print(f"Epoch {epoch+1} Summary:")
+        print(f"  Avg Loss: {avg_epoch_loss:.4f}")
+
+        # 显示各语言对的平均损失
+        print(f"\nTop 10 Language Pairs (by Loss):")
+        sorted_pairs = sorted(
+            epoch_metrics.items(),
+            key=lambda x: x[1]['loss'] / x[1]['count']
+        )[:10]
+
+        for lang_pair, metrics in sorted_pairs:
+            avg_loss = metrics['loss'] / metrics['count']
+            print(f"  {lang_pair:10s} | Loss: {avg_loss:.4f}")
+
+        print(f"{'='*80}\n")
+
+        # =====================================
+        # Save Checkpoint
+        # =====================================
+
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
+            save_path = os.path.join(checkpoint_dir, "best_loss_model.pth")
+            torch.save(model.state_dict(), save_path)
+            print(f"✨ Best loss model saved: {save_path}")
+
+        # 保存每个epoch的模型
+        epoch_save_path = os.path.join(checkpoint_dir, f"model_epoch_{epoch+1}.pth")
+        torch.save(model.state_dict(), epoch_save_path)
+
+    print("\n" + "="*80)
+    print("✅ Training Finished!")
+    print(f"Best BLEU: {best_bleu:.4f}")
+    print(f"Best Loss: {best_loss:.4f}")
+    print("="*80)
+
+
+# =====================================
+# Windows Safe Entry
+# =====================================
+
+if __name__ == "__main__":
+    from multiprocessing import freeze_support
+    freeze_support()
+    main()
