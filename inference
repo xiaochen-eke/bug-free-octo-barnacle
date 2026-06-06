@@ -1,0 +1,302 @@
+"""
+推理脚本 - 使用训练好的模型进行多语言翻译
+"""
+
+import os
+import sys
+from typing import List, Tuple
+
+import torch
+import sentencepiece as spm
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
+
+MODELS_DIR = os.path.join(BACKEND_DIR, "models")
+DATASETS_DIR = os.path.join(BACKEND_DIR, "datasets")
+
+sys.path.insert(0, MODELS_DIR)
+sys.path.insert(0, DATASETS_DIR)
+
+from transformer import TransformerModel
+
+
+# =====================================
+# 推理器
+# =====================================
+
+class Translator:
+    """多语言翻译推理器"""
+    
+    def __init__(self, model_path: str, sp_model_path: str, 
+                 vocab_size: int = 32000, max_len: int = 128,
+                 device: str = 'cuda'):
+        """
+        初始化翻译器
+        
+        Args:
+            model_path: 训练好的模型路径
+            sp_model_path: SentencePiece tokenizer路径
+            vocab_size: 词表大小
+            max_len: 最大序列长度
+            device: 设备 ('cuda' 或 'cpu')
+        """
+        self.device = torch.device(device)
+        self.vocab_size = vocab_size
+        self.max_len = max_len
+        
+        # 加载模型
+        print("📦 加载模型...")
+        self.model = TransformerModel(vocab_size=vocab_size).to(self.device)
+        
+        if os.path.exists(model_path):
+            state_dict = torch.load(model_path, map_location=self.device)
+            self.model.load_state_dict(state_dict)
+            print(f"✓ 模型已加载: {model_path}")
+        else:
+            raise FileNotFoundError(f"模型不存在: {model_path}")
+        
+        self.model.eval()
+        
+        # 加载 tokenizer
+        print("🔤 加载 Tokenizer...")
+        self.sp = spm.SentencePieceProcessor()
+        self.sp.Load(sp_model_path)
+        print(f"✓ Tokenizer已加载: {sp_model_path}")
+        print(f"  词表大小: {self.sp.get_piece_size()}\n")
+    
+    def encode(self, text: str, lang_token: str = "") -> torch.Tensor:
+        """编码文本"""
+        # 添加语言标记
+        if lang_token:
+            text = f"{lang_token} {text}"
+        
+        # Tokenize
+        tokens = self.sp.EncodeAsIds(text)
+        
+        # 填充或截断
+        if len(tokens) < self.max_len:
+            tokens = tokens + [0] * (self.max_len - len(tokens))
+        else:
+            tokens = tokens[:self.max_len]
+        
+        return torch.tensor([tokens], dtype=torch.long).to(self.device)
+    
+    def decode(self, token_ids: List[int]) -> str:
+        """解码token"""
+        # 移除pad
+        token_ids = [t for t in token_ids if t > 0]
+        
+        # Detokenize
+        text = self.sp.DecodeIds(token_ids)
+        
+        return text
+    
+    def translate(self, src_text: str, src_lang: str = "", 
+                  tgt_lang: str = "", beam_size: int = 1) -> str:
+        """
+        翻译文本
+        
+        Args:
+            src_text: 源文本
+            src_lang: 源语言代码（如 "<2en>", "<2ja>")
+            tgt_lang: 目标语言代码（用于显示）
+            beam_size: 束搜索大小（1=贪心，>1=束搜索）
+        
+        Returns:
+            翻译结果
+        """
+        # 编码源文本
+        src_tokens = self.encode(src_text, src_lang)
+        
+        with torch.no_grad():
+            # 初始化目标序列（只有BOS）
+            tgt_tokens = torch.tensor([[0]], dtype=torch.long).to(self.device)
+            
+            # 逐步生成
+            for step in range(self.max_len - 1):
+                # 前向传播
+                logits = self.model(src_tokens, tgt_tokens)
+                
+                # 获取最后一个时间步的预测
+                next_token_logits = logits[0, -1, :]
+                
+                if beam_size == 1:
+                    # 贪心解码
+                    next_token = next_token_logits.argmax(dim=-1).item()
+                else:
+                    # 束搜索（简化版）
+                    top_k_logits, top_k_indices = torch.topk(next_token_logits, beam_size)
+                    next_token = top_k_indices[0].item()
+                
+                # 添加到序列
+                tgt_tokens = torch.cat([
+                    tgt_tokens,
+                    torch.tensor([[next_token]], dtype=torch.long).to(self.device)
+                ], dim=1)
+                
+                # 如果生成了EOS，停止
+                if next_token == 0:
+                    break
+        
+        # 解码
+        tgt_ids = tgt_tokens[0].tolist()
+        translation = self.decode(tgt_ids)
+        
+        return translation
+    
+    def translate_batch(self, texts: List[str], src_lang: str = "", 
+                       beam_size: int = 1) -> List[str]:
+        """批量翻译"""
+        results = []
+        for text in texts:
+            result = self.translate(text, src_lang, beam_size=beam_size)
+            results.append(result)
+        return results
+
+
+# =====================================
+# 命令行接口
+# =====================================
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='多语言翻译推理')
+    parser.add_argument('--model-path', type=str,
+                        default=r'C:\DLdata\git\ecj\multilingual_transformer\backend\checkpoints\best_model.pth',
+                        help='模型路径')
+    parser.add_argument('--sp-model', type=str,
+                        default=r'C:\DLdata\git\ecj\multilingual_transformer\backend\tokenizer\multilingual.model',
+                        help='Tokenizer模型')
+    parser.add_argument('--src-lang', type=str, default='<2en>',
+                        help='源语言标记 (例: <2en>, <2ja>, <2fr>)')
+    parser.add_argument('--tgt-lang', type=str, default='en',
+                        help='目标语言名称（仅用于显示）')
+    parser.add_argument('--input', type=str, default='',
+                        help='输入文本（如果为空则进入交互模式）')
+    parser.add_argument('--input-file', type=str, default='',
+                        help='输入文件路径')
+    parser.add_argument('--output-file', type=str, default='',
+                        help='输出文件路径')
+    parser.add_argument('--beam-size', type=int, default=1,
+                        help='束搜索大小')
+    
+    args = parser.parse_args()
+    
+    # =====================================
+    # 初始化翻译器
+    # =====================================
+    
+    print("="*80)
+    print("🌍 多语言翻译推理系统")
+    print("="*80 + "\n")
+    
+    translator = Translator(
+        model_path=args.model_path,
+        sp_model_path=args.sp_model
+    )
+    
+    # =====================================
+    # 推理
+    # =====================================
+    
+    if args.input_file:
+        # 从文件读取
+        print(f"📖 读取输入文件: {args.input_file}")
+        with open(args.input_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        translations = []
+        for i, line in enumerate(lines):
+            text = line.strip()
+            if not text:
+                continue
+            
+            print(f"\n[{i+1}/{len(lines)}]")
+            print(f"  源文本: {text[:100]}...")
+            translation = translator.translate(text, args.src_lang)
+            print(f"  翻译:   {translation[:100]}...")
+            translations.append(translation)
+        
+        # 保存结果
+        if args.output_file:
+            print(f"\n💾 保存结果到: {args.output_file}")
+            with open(args.output_file, 'w', encoding='utf-8') as f:
+                for trans in translations:
+                    f.write(trans + '\n')
+    
+    elif args.input:
+        # 单句翻译
+        print(f"源文本: {args.input}")
+        translation = translator.translate(args.input, args.src_lang)
+        print(f"翻译:   {translation}")
+    
+    else:
+        # 交互模式
+        print("💬 交互翻译模式")
+        print(f"源语言标记: {args.src_lang}")
+        print(f"目标语言: {args.tgt_lang}")
+        print("输入 'exit' 退出\n")
+        
+        while True:
+            try:
+                text = input("源文本> ").strip()
+                if text.lower() == 'exit':
+                    break
+                if not text:
+                    continue
+                
+                translation = translator.translate(text, args.src_lang)
+                print(f"翻译>   {translation}\n")
+            
+            except KeyboardInterrupt:
+                print("\n\n再见!")
+                break
+            except Exception as e:
+                print(f"错误: {e}\n")
+
+
+# =====================================
+# 使用示例
+# =====================================
+
+def examples():
+    """
+    使用示例：
+    
+    # 1. 交互模式（默认）
+    python inference.py
+    
+    # 2. 翻译单句
+    python inference.py --input "Hello world" --src-lang "<2en>" --tgt-lang "Japanese"
+    
+    # 3. 翻译文件
+    python inference.py \
+        --input-file input.txt \
+        --output-file output.txt \
+        --src-lang "<2en>"
+    
+    # 4. 编程使用
+    from inference import Translator
+    
+    translator = Translator(
+        model_path='checkpoints/best_model.pth',
+        sp_model_path='tokenizer/multilingual.model'
+    )
+    
+    # 单句翻译
+    result = translator.translate("Hello", src_lang="<2en>")
+    print(result)  # 日文翻译
+    
+    # 批量翻译
+    results = translator.translate_batch(
+        ["Hello", "World"],
+        src_lang="<2en>"
+    )
+    """
+    pass
+
+
+if __name__ == "__main__":
+    main()
