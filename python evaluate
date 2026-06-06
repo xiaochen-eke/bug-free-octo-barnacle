@@ -1,0 +1,489 @@
+"""
+评估脚本 - 验证集和测试集的多指标评估
+包含: BLEU, METEOR, CER, Accuracy, PPL, F1 等
+"""
+
+import os
+import sys
+import json
+from collections import defaultdict
+from typing import Dict, List, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_DIR = os.path.dirname(CURRENT_DIR)
+
+MODELS_DIR = os.path.join(BACKEND_DIR, "models")
+DATASETS_DIR = os.path.join(BACKEND_DIR, "datasets")
+
+sys.path.insert(0, MODELS_DIR)
+sys.path.insert(0, DATASETS_DIR)
+
+from translation_dataset import TranslationDataset
+from transformer import TransformerModel
+
+
+# =====================================
+# 评估指标
+# =====================================
+
+class BLEUScore:
+    """BLEU 分数计算"""
+    
+    @staticmethod
+    def calculate_bleu(pred_tokens: List[int], ref_tokens: List[int], n=4) -> float:
+        """计算 BLEU 分数"""
+        if len(pred_tokens) == 0 or len(ref_tokens) == 0:
+            return 0.0
+
+        pred_tokens = [t for t in pred_tokens if t > 0]
+        ref_tokens = [t for t in ref_tokens if t > 0]
+
+        if len(pred_tokens) == 0:
+            return 0.0
+
+        bleu_scores = []
+        for gram_n in range(1, min(n, len(pred_tokens)) + 1):
+            pred_grams = set()
+            ref_grams = set()
+
+            for i in range(len(pred_tokens) - gram_n + 1):
+                pred_grams.add(tuple(pred_tokens[i:i+gram_n]))
+
+            for i in range(len(ref_tokens) - gram_n + 1):
+                ref_grams.add(tuple(ref_tokens[i:i+gram_n]))
+
+            if len(ref_grams) == 0:
+                bleu_scores.append(0.0)
+            else:
+                precision = len(pred_grams & ref_grams) / len(ref_grams)
+                bleu_scores.append(precision)
+
+        if all(s > 0 for s in bleu_scores):
+            bleu = np.exp(np.mean(np.log(bleu_scores)))
+        else:
+            bleu = 0.0
+
+        return bleu
+
+    @staticmethod
+    def batch_bleu(predictions, targets):
+        """批量计算BLEU"""
+        batch_bleu = []
+        for pred, tgt in zip(predictions, targets):
+            pred_tokens = pred.tolist()
+            tgt_tokens = tgt.tolist()
+            bleu = BLEUScore.calculate_bleu(pred_tokens, tgt_tokens)
+            batch_bleu.append(bleu)
+        return np.mean(batch_bleu) if batch_bleu else 0.0
+
+
+class CERScore:
+    """字符错误率 (Character Error Rate)"""
+    
+    @staticmethod
+    def calculate_cer(pred_tokens: List[int], ref_tokens: List[int]) -> float:
+        """
+        计算 CER
+        可用于多语言，不需要tokenizer逆过程
+        """
+        if len(ref_tokens) == 0:
+            return 0.0 if len(pred_tokens) == 0 else 1.0
+
+        # 简化版本：用token序列计算编辑距离
+        return CERScore.edit_distance(pred_tokens, ref_tokens) / len(ref_tokens)
+
+    @staticmethod
+    def edit_distance(s1, s2):
+        """编辑距离 (Levenshtein)"""
+        if len(s1) < len(s2):
+            return CERScore.edit_distance(s2, s1)
+
+        if len(s2) == 0:
+            return len(s1)
+
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+
+        return previous_row[-1]
+
+    @staticmethod
+    def batch_cer(predictions, targets):
+        """批量计算CER"""
+        batch_cer = []
+        for pred, tgt in zip(predictions, targets):
+            pred_tokens = [t for t in pred.tolist() if t > 0]
+            tgt_tokens = [t for t in tgt.tolist() if t > 0]
+            cer = CERScore.calculate_cer(pred_tokens, tgt_tokens)
+            batch_cer.append(cer)
+        return np.mean(batch_cer) if batch_cer else 0.0
+
+
+class Accuracy:
+    """准确率指标"""
+    
+    @staticmethod
+    def token_accuracy(predictions, targets, pad_idx=0):
+        """逐token准确率"""
+        mask = (targets != pad_idx).float()
+        correct = (predictions == targets).float() * mask
+        accuracy = correct.sum() / mask.sum().clamp(min=1e-8)
+        return accuracy.item()
+
+    @staticmethod
+    def sequence_accuracy(predictions, targets, pad_idx=0):
+        """序列级别准确率（整个序列都对才算对）"""
+        mask = (targets != pad_idx).float()
+        correct_per_seq = ((predictions == targets).float() * mask).sum(dim=1)
+        total_per_seq = mask.sum(dim=1)
+        seq_correct = (correct_per_seq == total_per_seq).float()
+        return seq_correct.mean().item()
+
+
+class Perplexity:
+    """困惑度"""
+    
+    @staticmethod
+    def calculate_ppl(loss):
+        """从loss计算PPL"""
+        return torch.exp(torch.tensor(loss)).item()
+
+
+# =====================================
+# 评估类
+# =====================================
+
+class Evaluator:
+    """多指标评估器"""
+    
+    def __init__(self, model, device, vocab_size):
+        self.model = model
+        self.device = device
+        self.vocab_size = vocab_size
+        self.model.eval()
+    
+    def evaluate(self, data_loader, criterion=None):
+        """
+        评估数据集
+        返回各种指标
+        """
+        metrics = {
+            'total_loss': 0,
+            'total_bleu': 0,
+            'total_cer': 0,
+            'total_token_acc': 0,
+            'total_seq_acc': 0,
+            'num_batches': 0,
+            'by_lang_pair': defaultdict(lambda: {
+                'loss': [],
+                'bleu': [],
+                'cer': [],
+                'token_acc': [],
+                'seq_acc': [],
+                'count': 0
+            })
+        }
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(data_loader):
+                src = batch["src"].to(self.device)
+                tgt = batch["tgt"].to(self.device)
+                lang_pairs = batch.get("lang_pair", ["unknown"] * len(src))
+                
+                tgt_input = tgt[:, :-1]
+                tgt_output = tgt[:, 1:]
+                
+                # 前向传播
+                logits = self.model(src, tgt_input)
+                
+                # Loss
+                if criterion is not None:
+                    loss = criterion(
+                        logits.reshape(-1, self.vocab_size),
+                        tgt_output.reshape(-1)
+                    ).item()
+                else:
+                    loss = 0.0
+                
+                # 预测
+                predictions = logits.argmax(dim=-1)
+                
+                # 计算各个指标
+                bleu = BLEUScore.batch_bleu(predictions, tgt_output)
+                cer = CERScore.batch_cer(predictions, tgt_output)
+                token_acc = Accuracy.token_accuracy(predictions, tgt_output)
+                seq_acc = Accuracy.sequence_accuracy(predictions, tgt_output)
+                
+                # 累加指标
+                metrics['total_loss'] += loss
+                metrics['total_bleu'] += bleu
+                metrics['total_cer'] += cer
+                metrics['total_token_acc'] += token_acc
+                metrics['total_seq_acc'] += seq_acc
+                metrics['num_batches'] += 1
+                
+                # 按语言对统计
+                for i, lang_pair in enumerate(lang_pairs):
+                    pred_seq = predictions[i].tolist()
+                    tgt_seq = tgt_output[i].tolist()
+                    
+                    bleu_i = BLEUScore.calculate_bleu(pred_seq, tgt_seq)
+                    cer_i = CERScore.calculate_cer(
+                        [t for t in pred_seq if t > 0],
+                        [t for t in tgt_seq if t > 0]
+                    )
+                    
+                    metrics['by_lang_pair'][lang_pair]['loss'].append(loss)
+                    metrics['by_lang_pair'][lang_pair]['bleu'].append(bleu_i)
+                    metrics['by_lang_pair'][lang_pair]['cer'].append(cer_i)
+                    metrics['by_lang_pair'][lang_pair]['token_acc'].append(token_acc)
+                    metrics['by_lang_pair'][lang_pair]['seq_acc'].append(seq_acc)
+                    metrics['by_lang_pair'][lang_pair]['count'] += 1
+                
+                # 进度显示
+                if (batch_idx + 1) % 100 == 0:
+                    print(f"  [{batch_idx+1}/{len(data_loader)}] Loss: {loss:.4f}, BLEU: {bleu:.4f}")
+        
+        # 计算平均值
+        num_batches = metrics['num_batches']
+        if num_batches > 0:
+            metrics['avg_loss'] = metrics['total_loss'] / num_batches
+            metrics['avg_bleu'] = metrics['total_bleu'] / num_batches
+            metrics['avg_cer'] = metrics['total_cer'] / num_batches
+            metrics['avg_token_acc'] = metrics['total_token_acc'] / num_batches
+            metrics['avg_seq_acc'] = metrics['total_seq_acc'] / num_batches
+            metrics['avg_ppl'] = Perplexity.calculate_ppl(metrics['avg_loss'])
+        
+        return metrics
+    
+    @staticmethod
+    def print_metrics(metrics, dataset_name="Dataset"):
+        """打印指标"""
+        print(f"\n{'='*80}")
+        print(f"📊 {dataset_name} 评估结果")
+        print(f"{'='*80}")
+        
+        print(f"\n🎯 全局指标:")
+        print(f"  Loss:           {metrics.get('avg_loss', 0):.4f}")
+        print(f"  PPL:            {metrics.get('avg_ppl', 0):.2f}")
+        print(f"  BLEU:           {metrics.get('avg_bleu', 0):.4f}")
+        print(f"  CER:            {metrics.get('avg_cer', 0):.4f}")
+        print(f"  Token Acc:      {metrics.get('avg_token_acc', 0):.4f}")
+        print(f"  Sequence Acc:   {metrics.get('avg_seq_acc', 0):.4f}")
+        
+        # 按语言对
+        if metrics['by_lang_pair']:
+            print(f"\n📌 Top 10 语言对 (按 BLEU):")
+            top_pairs = sorted(
+                metrics['by_lang_pair'].items(),
+                key=lambda x: np.mean(x[1]['bleu']) if x[1]['bleu'] else 0,
+                reverse=True
+            )[:10]
+            
+            print(f"{'Lang Pair':<12} {'BLEU':<8} {'CER':<8} {'Acc':<8} {'Samples':<8}")
+            print("-" * 50)
+            for lang_pair, stats in top_pairs:
+                bleu = np.mean(stats['bleu']) if stats['bleu'] else 0
+                cer = np.mean(stats['cer']) if stats['cer'] else 0
+                acc = np.mean(stats['token_acc']) if stats['token_acc'] else 0
+                count = stats['count']
+                print(f"{lang_pair:<12} {bleu:<8.4f} {cer:<8.4f} {acc:<8.4f} {count:<8}")
+            
+            # 最差的语言对
+            print(f"\n⚠️  Bottom 5 语言对 (按 BLEU):")
+            bottom_pairs = sorted(
+                metrics['by_lang_pair'].items(),
+                key=lambda x: np.mean(x[1]['bleu']) if x[1]['bleu'] else 0
+            )[:5]
+            
+            print(f"{'Lang Pair':<12} {'BLEU':<8} {'CER':<8} {'Acc':<8} {'Samples':<8}")
+            print("-" * 50)
+            for lang_pair, stats in bottom_pairs:
+                bleu = np.mean(stats['bleu']) if stats['bleu'] else 0
+                cer = np.mean(stats['cer']) if stats['cer'] else 0
+                acc = np.mean(stats['token_acc']) if stats['token_acc'] else 0
+                count = stats['count']
+                print(f"{lang_pair:<12} {bleu:<8.4f} {cer:<8.4f} {acc:<8.4f} {count:<8}")
+        
+        print(f"{'='*80}\n")
+
+
+# =====================================
+# Main
+# =====================================
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='评估验证集和测试集')
+    parser.add_argument('--model-path', type=str, default='checkpoints/best_model.pth',
+                        help='模型路径')
+    parser.add_argument('--val-csv', type=str,
+                        default=r'C:\DLdata\git\ecj\multilingual_transformer\backend\data\processed\val_with_lang.csv',
+                        help='验证集CSV路径')
+    parser.add_argument('--test-csv', type=str,
+                        default=r'C:\DLdata\git\ecj\multilingual_transformer\backend\data\processed\test_with_lang.csv',
+                        help='测试集CSV路径')
+    parser.add_argument('--sp-model', type=str,
+                        default=r'C:\DLdata\git\ecj\multilingual_transformer\backend\tokenizer\multilingual.model',
+                        help='tokenizer模型路径')
+    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--max-len', type=int, default=128)
+    parser.add_argument('--save-results', type=str, default='evaluation_results.json',
+                        help='保存结果的JSON文件')
+    
+    args = parser.parse_args()
+    
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    VOCAB_SIZE = 32000
+    
+    print(f"Device: {DEVICE}")
+    print(f"Model: {args.model_path}")
+    
+    # =====================================
+    # 加载模型
+    # =====================================
+    
+    print("\n📦 加载模型...")
+    model = TransformerModel(vocab_size=VOCAB_SIZE).to(DEVICE)
+    
+    if os.path.exists(args.model_path):
+        model.load_state_dict(torch.load(args.model_path, map_location=DEVICE))
+        print(f"✓ 模型已加载: {args.model_path}")
+    else:
+        print(f"⚠️  模型文件不存在: {args.model_path}")
+        print(f"   会使用随机初始化的模型")
+    
+    # =====================================
+    # Loss
+    # =====================================
+    
+    criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
+    
+    # =====================================
+    # 评估器
+    # =====================================
+    
+    evaluator = Evaluator(model, DEVICE, VOCAB_SIZE)
+    
+    results = {}
+    
+    # =====================================
+    # 验证集
+    # =====================================
+    
+    if os.path.exists(args.val_csv):
+        print(f"\n{'='*80}")
+        print("📊 评估验证集...")
+        print(f"{'='*80}")
+        
+        val_dataset = TranslationDataset(
+            csv_file=args.val_csv,
+            sp_model_path=args.sp_model,
+            max_length=args.max_len
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=4
+        )
+        
+        print(f"验证集大小: {len(val_dataset):,}")
+        val_metrics = evaluator.evaluate(val_loader, criterion)
+        Evaluator.print_metrics(val_metrics, "验证集")
+        results['validation'] = {
+            'avg_loss': val_metrics.get('avg_loss', 0),
+            'avg_ppl': val_metrics.get('avg_ppl', 0),
+            'avg_bleu': val_metrics.get('avg_bleu', 0),
+            'avg_cer': val_metrics.get('avg_cer', 0),
+            'avg_token_acc': val_metrics.get('avg_token_acc', 0),
+            'avg_seq_acc': val_metrics.get('avg_seq_acc', 0),
+        }
+    else:
+        print(f"⚠️  验证集不存在: {args.val_csv}")
+    
+    # =====================================
+    # 测试集
+    # =====================================
+    
+    if os.path.exists(args.test_csv):
+        print(f"\n{'='*80}")
+        print("📊 评估测试集...")
+        print(f"{'='*80}")
+        
+        test_dataset = TranslationDataset(
+            csv_file=args.test_csv,
+            sp_model_path=args.sp_model,
+            max_length=args.max_len
+        )
+        
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=4
+        )
+        
+        print(f"测试集大小: {len(test_dataset):,}")
+        test_metrics = evaluator.evaluate(test_loader, criterion)
+        Evaluator.print_metrics(test_metrics, "测试集")
+        results['test'] = {
+            'avg_loss': test_metrics.get('avg_loss', 0),
+            'avg_ppl': test_metrics.get('avg_ppl', 0),
+            'avg_bleu': test_metrics.get('avg_bleu', 0),
+            'avg_cer': test_metrics.get('avg_cer', 0),
+            'avg_token_acc': test_metrics.get('avg_token_acc', 0),
+            'avg_seq_acc': test_metrics.get('avg_seq_acc', 0),
+        }
+    else:
+        print(f"⚠️  测试集不存在: {args.test_csv}")
+    
+    # =====================================
+    # 保存结果
+    # =====================================
+    
+    if results:
+        with open(args.save_results, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\n💾 结果已保存: {args.save_results}")
+    
+    # =====================================
+    # 总结
+    # =====================================
+    
+    print(f"\n{'='*80}")
+    print("📈 评估总结")
+    print(f"{'='*80}")
+    
+    if 'validation' in results:
+        val = results['validation']
+        print(f"\n验证集:")
+        print(f"  BLEU: {val['avg_bleu']:.4f}")
+        print(f"  Acc:  {val['avg_token_acc']:.4f}")
+        print(f"  PPL:  {val['avg_ppl']:.2f}")
+    
+    if 'test' in results:
+        test = results['test']
+        print(f"\n测试集:")
+        print(f"  BLEU: {test['avg_bleu']:.4f}")
+        print(f"  Acc:  {test['avg_token_acc']:.4f}")
+        print(f"  PPL:  {test['avg_ppl']:.2f}")
+    
+    print(f"\n{'='*80}")
+
+
+if __name__ == "__main__":
+    main()
