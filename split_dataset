@@ -1,0 +1,151 @@
+"""
+数据分割脚本 - 从原始数据生成训练/验证/测试集
+"""
+
+import os
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+# =====================================
+# 配置
+# =====================================
+
+INPUT_CSV = r"C:\DLdata\git\ecj\multilingual_transformer\backend\data\processed\train_with_lang.csv"
+OUTPUT_DIR = r"C:\DLdata\git\ecj\multilingual_transformer\backend\data\processed"
+
+# 分割比例
+TRAIN_RATIO = 0.70   # 70% 训练
+VAL_RATIO = 0.15     # 15% 验证
+TEST_RATIO = 0.15    # 15% 测试
+
+RANDOM_SEED = 42
+STRATIFY_BY = 'lang_pair'  # 按语言对分层，保持分布一致
+
+
+# =====================================
+# Main
+# =====================================
+
+def main():
+    print("=" * 80)
+    print("📊 数据分割工具")
+    print("=" * 80)
+    
+    # 1. 读取数据
+    print(f"\n📖 读取数据: {INPUT_CSV}")
+    df = pd.read_csv(INPUT_CSV)
+    original_size = len(df)
+    print(f"  原始数据量: {original_size:,}")
+    
+    # 2. 检查数据完整性
+    print(f"\n🔍 检查数据完整性...")
+    print(f"  缺失值:")
+    print(f"    src: {df['src'].isna().sum()}")
+    print(f"    tgt: {df['tgt'].isna().sum()}")
+    print(f"    lang_pair: {df['lang_pair'].isna().sum()}")
+    
+    # 3. 分割数据
+    print(f"\n✂️  分割数据...")
+    print(f"  Train: {TRAIN_RATIO*100:.0f}% = {int(original_size*TRAIN_RATIO):,}")
+    print(f"  Val:   {VAL_RATIO*100:.0f}% = {int(original_size*VAL_RATIO):,}")
+    print(f"  Test:  {TEST_RATIO*100:.0f}% = {int(original_size*TEST_RATIO):,}")
+    
+    # 第一次分割：训练 vs （验证+测试）
+    train_df, temp_df = train_test_split(
+        df,
+        test_size=(VAL_RATIO + TEST_RATIO),
+        random_state=RANDOM_SEED,
+        stratify=df[STRATIFY_BY] if STRATIFY_BY in df.columns else None
+    )
+    
+    # 第二次分割：验证 vs 测试
+    val_df, test_df = train_test_split(
+        temp_df,
+        test_size=TEST_RATIO / (VAL_RATIO + TEST_RATIO),
+        random_state=RANDOM_SEED,
+        stratify=temp_df[STRATIFY_BY] if STRATIFY_BY in temp_df.columns else None
+    )
+    
+    # 4. 验证分割
+    print(f"\n✓ 分割完成:")
+    print(f"  Train: {len(train_df):,} ({len(train_df)/original_size*100:.1f}%)")
+    print(f"  Val:   {len(val_df):,} ({len(val_df)/original_size*100:.1f}%)")
+    print(f"  Test:  {len(test_df):,} ({len(test_df)/original_size*100:.1f}%)")
+    print(f"  总计:  {len(train_df)+len(val_df)+len(test_df):,}")
+    
+    # 5. 检查语言对分布
+    if STRATIFY_BY in df.columns:
+        print(f"\n📊 语言对分布均衡性:")
+        print(f"  原始数据前5语言对:")
+        print(f"    {df[STRATIFY_BY].value_counts().head(5).to_dict()}")
+        print(f"  训练集前5语言对:")
+        print(f"    {train_df[STRATIFY_BY].value_counts().head(5).to_dict()}")
+        print(f"  验证集前5语言对:")
+        print(f"    {val_df[STRATIFY_BY].value_counts().head(5).to_dict()}")
+        print(f"  测试集前5语言对:")
+        print(f"    {test_df[STRATIFY_BY].value_counts().head(5).to_dict()}")
+    
+    # 6. 保存数据
+    print(f"\n💾 保存数据...")
+    
+    train_path = os.path.join(OUTPUT_DIR, "train_with_lang.csv")
+    val_path = os.path.join(OUTPUT_DIR, "val_with_lang.csv")
+    test_path = os.path.join(OUTPUT_DIR, "test_with_lang.csv")
+    
+    train_df.to_csv(train_path, index=False)
+    print(f"  ✓ {train_path}")
+    
+    val_df.to_csv(val_path, index=False)
+    print(f"  ✓ {val_path}")
+    
+    test_df.to_csv(test_path, index=False)
+    print(f"  ✓ {test_path}")
+    
+    # 7. 生成统计报告
+    print(f"\n📈 统计报告:")
+    
+    for split_name, split_df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+        print(f"\n  {split_name}集:")
+        print(f"    样本数: {len(split_df):,}")
+        if 'lang_pair' in split_df.columns:
+            print(f"    语言对数: {split_df['lang_pair'].nunique()}")
+            print(f"    最多的语言对: {split_df['lang_pair'].value_counts().index[0]} ({split_df['lang_pair'].value_counts().iloc[0]:,})")
+            print(f"    最少的语言对: {split_df['lang_pair'].value_counts().index[-1]} ({split_df['lang_pair'].value_counts().iloc[-1]:,})")
+        if 'src' in split_df.columns:
+            src_lengths = split_df['src'].str.split().str.len()
+            print(f"    源文本平均长度: {src_lengths.mean():.1f}")
+        if 'tgt' in split_df.columns:
+            tgt_lengths = split_df['tgt'].str.split().str.len()
+            print(f"    目标文本平均长度: {tgt_lengths.mean():.1f}")
+    
+    # 8. 完成
+    print(f"\n{'='*80}")
+    print("✅ 数据分割完成！")
+    print(f"\n现在可以运行评估脚本:")
+    print(f"  python evaluate.py")
+    print(f"{'='*80}\n")
+    
+    # 保存分割信息
+    split_info = {
+        'original_size': original_size,
+        'train_size': len(train_df),
+        'val_size': len(val_df),
+        'test_size': len(test_df),
+        'train_ratio': TRAIN_RATIO,
+        'val_ratio': VAL_RATIO,
+        'test_ratio': TEST_RATIO,
+        'random_seed': RANDOM_SEED,
+        'train_path': train_path,
+        'val_path': val_path,
+        'test_path': test_path,
+    }
+    
+    import json
+    info_path = os.path.join(OUTPUT_DIR, "split_info.json")
+    with open(info_path, 'w') as f:
+        json.dump(split_info, f, indent=2)
+    print(f"分割信息已保存: {info_path}\n")
+
+
+if __name__ == "__main__":
+    main()
