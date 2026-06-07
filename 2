@@ -1,0 +1,568 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Optional, Tuple
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# 位置编码
+# ============================================================================
+
+class PositionalEncoding(nn.Module):
+    """位置编码（Positional Encoding）"""
+    
+    def __init__(self, d_model: int, max_seq_len: int = 5000, dropout: float = 0.1):
+        """
+        Args:
+            d_model: 模型维度
+            max_seq_len: 最大序列长度
+            dropout: Dropout比例
+        """
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        # 创建位置编码矩阵
+        pe = torch.zeros(max_seq_len, d_model)
+        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
+        
+        # 计算div_term
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float) *
+            -(math.log(10000.0) / d_model)
+        )
+        
+        # 应用sin和cos函数
+        pe[:, 0::2] = torch.sin(position * div_term)
+        if d_model % 2 == 1:
+            pe[:, 1::2] = torch.cos(position * div_term[:-1])
+        else:
+            pe[:, 1::2] = torch.cos(position * div_term)
+        
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, seq_len, d_model)
+        Returns:
+            (batch_size, seq_len, d_model)
+        """
+        seq_len = x.size(1)
+        x = x + self.pe[:, :seq_len, :]
+        return self.dropout(x)
+
+
+# ============================================================================
+# 多头自注意力机制
+# ============================================================================
+
+class MultiHeadAttention(nn.Module):
+    """多头自注意力机制（Multi-Head Attention）"""
+    
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
+        """
+        Args:
+            d_model: 模型维度
+            num_heads: 注意力头数
+            dropout: Dropout比例
+        """
+        super().__init__()
+        
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        
+        # 线性变换层
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, 
+                query: torch.Tensor, 
+                key: torch.Tensor, 
+                value: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            query: (batch_size, seq_len_q, d_model)
+            key: (batch_size, seq_len_k, d_model)
+            value: (batch_size, seq_len_v, d_model)
+            mask: (batch_size, 1, seq_len_q, seq_len_k)
+        
+        Returns:
+            output: (batch_size, seq_len_q, d_model)
+            attention_weights: (batch_size, num_heads, seq_len_q, seq_len_k)
+        """
+        batch_size = query.size(0)
+        
+        # 线性变换并分割为多个头
+        Q = self.W_q(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        K = self.W_k(key).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        V = self.W_v(value).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        
+        # 计算注意力分数
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+        
+        # 应用掩码
+        if mask is not None:
+            mask = mask.unsqueeze(1)  # (batch_size, 1, seq_len_q, seq_len_k)
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        
+        # 应用softmax
+        attention_weights = F.softmax(scores, dim=-1)
+        attention_weights = self.dropout(attention_weights)
+        
+        # 应用注意力权重到值
+        context = torch.matmul(attention_weights, V)
+        
+        # 合并多个头
+        context = context.transpose(1, 2).contiguous()
+        context = context.view(batch_size, -1, self.d_model)
+        
+        # 最终线性变换
+        output = self.W_o(context)
+        
+        return output, attention_weights
+
+
+# ============================================================================
+# 前馈网络
+# ============================================================================
+
+class FeedForwardNetwork(nn.Module):
+    """前馈网络（Feed-Forward Network）"""
+    
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
+        """
+        Args:
+            d_model: 模型维度
+            d_ff: 前馈网络隐藏层维度
+            dropout: Dropout比例
+        """
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, seq_len, d_model)
+        Returns:
+            (batch_size, seq_len, d_model)
+        """
+        return self.linear2(self.dropout(F.relu(self.linear1(x))))
+
+
+# ============================================================================
+# 编码器层
+# ============================================================================
+
+class EncoderLayer(nn.Module):
+    """编码器层"""
+    
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1):
+        """
+        Args:
+            d_model: 模型维度
+            num_heads: 注意力头数
+            d_ff: 前馈网络隐藏层维度
+            dropout: Dropout比例
+        """
+        super().__init__()
+        
+        self.self_attention = MultiHeadAttention(d_model, num_heads, dropout)
+        self.feed_forward = FeedForwardNetwork(d_model, d_ff, dropout)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, seq_len, d_model)
+            mask: (batch_size, seq_len)
+        Returns:
+            (batch_size, seq_len, d_model)
+        """
+        # 多头自注意力
+        attn_output, _ = self.self_attention(x, x, x, mask)
+        x = self.norm1(x + self.dropout(attn_output))
+        
+        # 前馈网络
+        ff_output = self.feed_forward(x)
+        x = self.norm2(x + self.dropout(ff_output))
+        
+        return x
+
+
+# ============================================================================
+# 编码器
+# ============================================================================
+
+class Encoder(nn.Module):
+    """编码器"""
+    
+    def __init__(self, 
+                 vocab_size: int,
+                 d_model: int = 512,
+                 num_layers: int = 6,
+                 num_heads: int = 8,
+                 d_ff: int = 2048,
+                 max_seq_len: int = 512,
+                 dropout: float = 0.1,
+                 padding_idx: int = 0):
+        """
+        Args:
+            vocab_size: 词汇表大小
+            d_model: 模型维度
+            num_layers: 编码器层数
+            num_heads: 注意力头数
+            d_ff: 前馈网络隐藏层维度
+            max_seq_len: 最大序列长度
+            dropout: Dropout比例
+            padding_idx: padding标记的索引
+        """
+        super().__init__()
+        
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx)
+        self.positional_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
+        
+        self.layers = nn.ModuleList([
+            EncoderLayer(d_model, num_heads, d_ff, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        self.dropout = nn.Dropout(dropout)
+        self.d_model = d_model
+    
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, seq_len)
+            mask: (batch_size, seq_len)
+        Returns:
+            (batch_size, seq_len, d_model)
+        """
+        # 嵌入
+        x = self.embedding(x) * math.sqrt(self.d_model)
+        x = self.positional_encoding(x)
+        
+        # 应用编码器层
+        for layer in self.layers:
+            x = layer(x, mask)
+        
+        return x
+
+
+# ============================================================================
+# 解码器层
+# ============================================================================
+
+class DecoderLayer(nn.Module):
+    """解码器层"""
+    
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1):
+        """
+        Args:
+            d_model: 模型维度
+            num_heads: 注意力头数
+            d_ff: 前馈网络隐藏层维度
+            dropout: Dropout比例
+        """
+        super().__init__()
+        
+        self.self_attention = MultiHeadAttention(d_model, num_heads, dropout)
+        self.cross_attention = MultiHeadAttention(d_model, num_heads, dropout)
+        self.feed_forward = FeedForwardNetwork(d_model, d_ff, dropout)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self,
+                x: torch.Tensor,
+                encoder_output: torch.Tensor,
+                tgt_mask: Optional[torch.Tensor] = None,
+                src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, seq_len_tgt, d_model)
+            encoder_output: (batch_size, seq_len_src, d_model)
+            tgt_mask: (batch_size, seq_len_tgt)
+            src_mask: (batch_size, seq_len_src)
+        Returns:
+            (batch_size, seq_len_tgt, d_model)
+        """
+        # 自注意力
+        attn_output, _ = self.self_attention(x, x, x, tgt_mask)
+        x = self.norm1(x + self.dropout(attn_output))
+        
+        # 交叉注意力
+        cross_attn_output, _ = self.cross_attention(x, encoder_output, encoder_output, src_mask)
+        x = self.norm2(x + self.dropout(cross_attn_output))
+        
+        # 前馈网络
+        ff_output = self.feed_forward(x)
+        x = self.norm3(x + self.dropout(ff_output))
+        
+        return x
+
+
+# ============================================================================
+# 解码器
+# ============================================================================
+
+class Decoder(nn.Module):
+    """解码器"""
+    
+    def __init__(self,
+                 vocab_size: int,
+                 d_model: int = 512,
+                 num_layers: int = 6,
+                 num_heads: int = 8,
+                 d_ff: int = 2048,
+                 max_seq_len: int = 512,
+                 dropout: float = 0.1,
+                 padding_idx: int = 0):
+        """
+        Args:
+            vocab_size: 词汇表大小
+            d_model: 模型维度
+            num_layers: 解码器层数
+            num_heads: 注意力头数
+            d_ff: 前馈网络隐藏层维度
+            max_seq_len: 最大序列长度
+            dropout: Dropout比例
+            padding_idx: padding标记的索引
+        """
+        super().__init__()
+        
+        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx)
+        self.positional_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
+        
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model, num_heads, d_ff, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        self.dropout = nn.Dropout(dropout)
+        self.d_model = d_model
+    
+    def forward(self,
+                x: torch.Tensor,
+                encoder_output: torch.Tensor,
+                tgt_mask: Optional[torch.Tensor] = None,
+                src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, seq_len_tgt)
+            encoder_output: (batch_size, seq_len_src, d_model)
+            tgt_mask: (batch_size, seq_len_tgt)
+            src_mask: (batch_size, seq_len_src)
+        Returns:
+            (batch_size, seq_len_tgt, d_model)
+        """
+        # 嵌入
+        x = self.embedding(x) * math.sqrt(self.d_model)
+        x = self.positional_encoding(x)
+        
+        # 应用解码器层
+        for layer in self.layers:
+            x = layer(x, encoder_output, tgt_mask, src_mask)
+        
+        return x
+
+
+# ============================================================================
+# 完整的Transformer模型
+# ============================================================================
+
+class Transformer(nn.Module):
+    """Transformer模型"""
+    
+    def __init__(self,
+                 src_vocab_size: int,
+                 tgt_vocab_size: int,
+                 d_model: int = 512,
+                 num_layers: int = 6,
+                 num_heads: int = 8,
+                 d_ff: int = 2048,
+                 max_seq_len: int = 512,
+                 dropout: float = 0.1,
+                 src_padding_idx: int = 0,
+                 tgt_padding_idx: int = 0):
+        """
+        Args:
+            src_vocab_size: 源语言词汇表大小
+            tgt_vocab_size: 目标语言词汇表大小
+            d_model: 模型维度
+            num_layers: 编码器和解码器的层数
+            num_heads: 多头注意力的头数
+            d_ff: 前馈网络的隐藏层维度
+            max_seq_len: 最大序列长度
+            dropout: Dropout比例
+            src_padding_idx: 源语言的padding索引
+            tgt_padding_idx: 目标语言的padding索引
+        """
+        super().__init__()
+        
+        self.encoder = Encoder(
+            vocab_size=src_vocab_size,
+            d_model=d_model,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            max_seq_len=max_seq_len,
+            dropout=dropout,
+            padding_idx=src_padding_idx
+        )
+        
+        self.decoder = Decoder(
+            vocab_size=tgt_vocab_size,
+            d_model=d_model,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            max_seq_len=max_seq_len,
+            dropout=dropout,
+            padding_idx=tgt_padding_idx
+        )
+        
+        self.output_projection = nn.Linear(d_model, tgt_vocab_size)
+        
+        self.src_padding_idx = src_padding_idx
+        self.tgt_padding_idx = tgt_padding_idx
+    
+    def forward(self,
+                src: torch.Tensor,
+                tgt: torch.Tensor,
+                src_mask: Optional[torch.Tensor] = None,
+                tgt_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            src: (batch_size, seq_len_src)
+            tgt: (batch_size, seq_len_tgt)
+            src_mask: (batch_size, seq_len_src)
+            tgt_mask: (batch_size, seq_len_tgt)
+        Returns:
+            logits: (batch_size, seq_len_tgt, tgt_vocab_size)
+        """
+        # 如果没有提供掩码，生成掩码
+        if src_mask is None:
+            src_mask = (src != self.src_padding_idx).float()
+        if tgt_mask is None:
+            tgt_mask = (tgt != self.tgt_padding_idx).float()
+        
+        # 编码
+        encoder_output = self.encoder(src, src_mask)
+        
+        # 解码
+        decoder_output = self.decoder(tgt, encoder_output, tgt_mask, src_mask)
+        
+        # 输出投影
+        logits = self.output_projection(decoder_output)
+        
+        return logits
+    
+    def encode(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """仅进行编码"""
+        if src_mask is None:
+            src_mask = (src != self.src_padding_idx).float()
+        return self.encoder(src, src_mask)
+    
+    def decode(self,
+               tgt: torch.Tensor,
+               encoder_output: torch.Tensor,
+               tgt_mask: Optional[torch.Tensor] = None,
+               src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """仅进行解码"""
+        return self.decoder(tgt, encoder_output, tgt_mask, src_mask)
+
+
+# ============================================================================
+# 模型配置
+# ============================================================================
+
+class TransformerConfig:
+    """Transformer配置类"""
+    
+    def __init__(self,
+                 src_vocab_size: int = 10000,
+                 tgt_vocab_size: int = 10000,
+                 d_model: int = 512,
+                 num_layers: int = 6,
+                 num_heads: int = 8,
+                 d_ff: int = 2048,
+                 max_seq_len: int = 512,
+                 dropout: float = 0.1):
+        
+        self.src_vocab_size = src_vocab_size
+        self.tgt_vocab_size = tgt_vocab_size
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.max_seq_len = max_seq_len
+        self.dropout = dropout
+    
+    def to_dict(self):
+        return {
+            'src_vocab_size': self.src_vocab_size,
+            'tgt_vocab_size': self.tgt_vocab_size,
+            'd_model': self.d_model,
+            'num_layers': self.num_layers,
+            'num_heads': self.num_heads,
+            'd_ff': self.d_ff,
+            'max_seq_len': self.max_seq_len,
+            'dropout': self.dropout,
+        }
+    
+    @classmethod
+    def from_dict(cls, config_dict):
+        return cls(**config_dict)
+
+
+if __name__ == '__main__':
+    # 简单测试
+    config = TransformerConfig(
+        src_vocab_size=5000,
+        tgt_vocab_size=5000,
+        d_model=512,
+        num_layers=6,
+        num_heads=8,
+        d_ff=2048,
+        max_seq_len=128,
+        dropout=0.1
+    )
+    
+    model = Transformer(
+        src_vocab_size=config.src_vocab_size,
+        tgt_vocab_size=config.tgt_vocab_size,
+        d_model=config.d_model,
+        num_layers=config.num_layers,
+        num_heads=config.num_heads,
+        d_ff=config.d_ff,
+        max_seq_len=config.max_seq_len,
+        dropout=config.dropout
+    )
+    
+    # 测试输入
+    src = torch.randint(1, 5000, (2, 32))  # (batch_size=2, seq_len=32)
+    tgt = torch.randint(1, 5000, (2, 32))
+    
+    output = model(src, tgt)
+    print(f"Output shape: {output.shape}")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
