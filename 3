@@ -1,0 +1,498 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import numpy as np
+from collections import defaultdict
+import logging
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from tqdm import tqdm
+import math
+import pickle
+
+# 导入自定义模块
+from transformer_model import Transformer, TransformerConfig
+from data_processor import Vocabulary
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# 学习率调度器
+# ============================================================================
+
+class WarmupScheduler:
+    """带预热的学习率调度器"""
+    
+    def __init__(self, optimizer: optim.Optimizer, d_model: int, warmup_steps: int = 4000):
+        """
+        Args:
+            optimizer: PyTorch优化器
+            d_model: 模型维度
+            warmup_steps: 预热步数
+        """
+        self.optimizer = optimizer
+        self.d_model = d_model
+        self.warmup_steps = warmup_steps
+        self.current_step = 0
+    
+    def step(self):
+        """更新学习率"""
+        self.current_step += 1
+        lr = self._get_lr()
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+    
+    def _get_lr(self) -> float:
+        """计算当前学习率"""
+        return self.d_model ** (-0.5) * min(
+            self.current_step ** (-0.5),
+            self.current_step * (self.warmup_steps ** (-1.5))
+        )
+    
+    def get_last_lr(self) -> List[float]:
+        """获取最后的学习率"""
+        return [group['lr'] for group in self.optimizer.param_groups]
+
+
+# ============================================================================
+# 损失函数
+# ============================================================================
+
+class TranslationLoss(nn.Module):
+    """翻译任务的损失函数"""
+    
+    def __init__(self, vocab_size: int, padding_idx: int = 0, smoothing: float = 0.1):
+        """
+        Args:
+            vocab_size: 词汇表大小
+            padding_idx: padding标记的索引
+            smoothing: 标签平滑系数
+        """
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.padding_idx = padding_idx
+        self.smoothing = smoothing
+        
+        if smoothing > 0:
+            self.criterion = self._create_label_smoothing_loss(vocab_size, padding_idx, smoothing)
+        else:
+            self.criterion = nn.CrossEntropyLoss(
+                ignore_index=padding_idx,
+                reduction='mean'
+            )
+    
+    @staticmethod
+    def _create_label_smoothing_loss(vocab_size: int, padding_idx: int, smoothing: float):
+        """创建带标签平滑的损失函数"""
+        return nn.CrossEntropyLoss(
+            ignore_index=padding_idx,
+            reduction='mean',
+            label_smoothing=smoothing
+        )
+    
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits: (batch_size, seq_len, vocab_size)
+            targets: (batch_size, seq_len)
+        Returns:
+            loss: 标量张量
+        """
+        # 重塑为(batch_size * seq_len, vocab_size)和(batch_size * seq_len)
+        logits_reshaped = logits.view(-1, self.vocab_size)
+        targets_reshaped = targets.view(-1)
+        
+        return self.criterion(logits_reshaped, targets_reshaped)
+
+
+# ============================================================================
+# BLEU分数计算
+# ============================================================================
+
+class BLEUScorer:
+    """BLEU分数计算器"""
+    
+    @staticmethod
+    def _get_ngrams(segment: List[str], max_order: int) -> Dict[Tuple, int]:
+        """获取n-gram"""
+        ngram_counts = defaultdict(int)
+        for order in range(1, max_order + 1):
+            for i in range(0, len(segment) - order + 1):
+                ngram = tuple(segment[i:i + order])
+                ngram_counts[ngram] += 1
+        return ngram_counts
+    
+    @staticmethod
+    def corpus_bleu(list_of_references: List[List[List[str]]],
+                   hypotheses: List[List[str]],
+                   max_order: int = 4,
+                   smooth: bool = False) -> float:
+        """
+        计算语料库级别的BLEU分数
+        
+        Args:
+            list_of_references: 参考翻译列表，格式为[[[ref1_1, ref1_2, ...]], [[ref2_1, ref2_2, ...]]]
+            hypotheses: 假设翻译列表，格式为[[hyp1_1, hyp1_2, ...], [hyp2_1, hyp2_2, ...]]
+            max_order: 最大n-gram阶数
+            smooth: 是否使用平滑
+        
+        Returns:
+            BLEU分数（0-1之间）
+        """
+        matches_by_order = [0] * max_order
+        possible_matches_by_order = [0] * max_order
+        reference_length = 0
+        hypothesis_length = 0
+        
+        for (references, hypothesis) in zip(list_of_references, hypotheses):
+            reference_length += min(len(r) for r in references)
+            hypothesis_length += len(hypothesis)
+            
+            merged_ref_ngram_counts = defaultdict(int)
+            for reference in references:
+                reference_ngrams = BLEUScorer._get_ngrams(reference, max_order)
+                for ngram in reference_ngrams:
+                    merged_ref_ngram_counts[ngram] = max(
+                        merged_ref_ngram_counts[ngram],
+                        reference_ngrams[ngram]
+                    )
+            
+            hypothesis_ngrams = BLEUScorer._get_ngrams(hypothesis, max_order)
+            overlap = defaultdict(int)
+            for ngram in hypothesis_ngrams:
+                overlap[ngram] = min(hypothesis_ngrams[ngram],
+                                    merged_ref_ngram_counts.get(ngram, 0))
+            
+            for order in range(1, max_order + 1):
+                possible_matches = len(hypothesis) - order + 1
+                if possible_matches > 0:
+                    matches = sum(overlap.get(ngram, 0)
+                                for ngram in overlap
+                                if len(ngram) == order)
+                    matches_by_order[order - 1] += matches
+                    possible_matches_by_order[order - 1] += possible_matches
+        
+        precisions = [0] * max_order
+        for i in range(0, max_order):
+            if smooth:
+                precisions[i] = ((matches_by_order[i] + 1.) /
+                               (possible_matches_by_order[i] + 1.))
+            else:
+                if possible_matches_by_order[i] > 0:
+                    precisions[i] = (float(matches_by_order[i]) /
+                                   possible_matches_by_order[i])
+                else:
+                    precisions[i] = 0.0
+        
+        if min(precisions) > 0:
+            p_log_sum = sum((1. / max_order) * math.log(p) for p in precisions)
+            geo_mean = math.exp(p_log_sum)
+        else:
+            geo_mean = 0
+        
+        ratio = float(hypothesis_length) / reference_length if reference_length > 0 else 0
+        
+        if ratio > 1.0:
+            bp = 1.
+        elif ratio > 0:
+            bp = math.exp(1 - 1. / ratio)
+        else:
+            bp = 0.0
+        
+        bleu = geo_mean * bp
+        return bleu
+
+
+# ============================================================================
+# 模型训练器
+# ============================================================================
+
+class Trainer:
+    """模型训练器"""
+    
+    def __init__(self,
+                 model: Transformer,
+                 src_vocab: Vocabulary,
+                 tgt_vocab: Vocabulary,
+                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+                 learning_rate: float = 0.0001,
+                 warmup_steps: int = 4000,
+                 label_smoothing: float = 0.1,
+                 gradient_clip: float = 1.0,
+                 log_dir: str = './logs'):
+        
+        self.model = model.to(device)
+        self.src_vocab = src_vocab
+        self.tgt_vocab = tgt_vocab
+        self.device = device
+        self.gradient_clip = gradient_clip
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 优化器和学习率调度器
+        self.optimizer = optim.Adam(
+            model.parameters(),
+            lr=learning_rate,
+            betas=(0.9, 0.98),
+            eps=1e-9
+        )
+        self.scheduler = WarmupScheduler(self.optimizer, model.decoder.d_model, warmup_steps)
+        
+        # 损失函数
+        self.criterion = TranslationLoss(
+            tgt_vocab.__len__(),
+            padding_idx=tgt_vocab.word2idx[Vocabulary.PAD_TOKEN],
+            smoothing=label_smoothing
+        ).to(device)
+        
+        # 训练历史
+        self.history = {
+            'train_loss': [],
+            'val_loss': [],
+            'val_bleu': [],
+            'learning_rate': []
+        }
+    
+    def train_epoch(self, train_loader: DataLoader) -> float:
+        """训练一个epoch"""
+        self.model.train()
+        total_loss = 0
+        pbar = tqdm(train_loader, desc="Training")
+        
+        for batch in pbar:
+            self.optimizer.zero_grad()
+            
+            # 移动数据到设备
+            src = batch['src'].to(self.device)
+            tgt = batch['tgt'].to(self.device)
+            src_mask = batch['src_mask'].to(self.device)
+            tgt_mask = batch['tgt_mask'].to(self.device)
+            
+            # 准备输入和目标
+            tgt_input = tgt[:, :-1]  # 移除<eos>
+            tgt_target = tgt[:, 1:]  # 移除<bos>
+            
+            # 前向传播
+            logits = self.model(src, tgt_input, src_mask, tgt_mask)
+            
+            # 计算损失
+            loss = self.criterion(logits, tgt_target)
+            
+            # 反向传播
+            loss.backward()
+            
+            # 梯度裁剪
+            if self.gradient_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+            
+            # 优化步骤
+            self.optimizer.step()
+            self.scheduler.step()
+            
+            total_loss += loss.item()
+            pbar.set_postfix({'loss': loss.item()})
+        
+        avg_loss = total_loss / len(train_loader)
+        self.history['train_loss'].append(avg_loss)
+        self.history['learning_rate'].append(self.scheduler.get_last_lr()[0])
+        
+        return avg_loss
+    
+    def validate(self, val_loader: DataLoader) -> Tuple[float, float]:
+        """验证模型"""
+        self.model.eval()
+        total_loss = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Validation"):
+                src = batch['src'].to(self.device)
+                tgt = batch['tgt'].to(self.device)
+                src_mask = batch['src_mask'].to(self.device)
+                tgt_mask = batch['tgt_mask'].to(self.device)
+                
+                tgt_input = tgt[:, :-1]
+                tgt_target = tgt[:, 1:]
+                
+                logits = self.model(src, tgt_input, src_mask, tgt_mask)
+                loss = self.criterion(logits, tgt_target)
+                total_loss += loss.item()
+        
+        avg_loss = total_loss / len(val_loader)
+        self.history['val_loss'].append(avg_loss)
+        
+        return avg_loss
+    
+    def train(self,
+              train_loader: DataLoader,
+              val_loader: DataLoader,
+              num_epochs: int = 50,
+              save_dir: str = './checkpoints'):
+        
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        best_val_loss = float('inf')
+        
+        for epoch in range(num_epochs):
+            logger.info(f"\nEpoch {epoch + 1}/{num_epochs}")
+            
+            # 训练
+            train_loss = self.train_epoch(train_loader)
+            logger.info(f"Training Loss: {train_loss:.4f}")
+            
+            # 验证
+            val_loss = self.validate(val_loader)
+            logger.info(f"Validation Loss: {val_loss:.4f}")
+            
+            # 保存最佳模型
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                self.save_checkpoint(str(save_path / 'best_model.pt'), epoch)
+                logger.info(f"Saved best model with val_loss={val_loss:.4f}")
+            
+            # 定期保存检查点
+            if (epoch + 1) % 5 == 0:
+                self.save_checkpoint(str(save_path / f'checkpoint_epoch_{epoch + 1}.pt'), epoch)
+        
+        # 保存训练历史
+        self.save_history(str(self.log_dir / 'history.json'))
+    
+    def save_checkpoint(self, filepath: str, epoch: int):
+        """保存检查点"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': {
+                'current_step': self.scheduler.current_step
+            },
+            'history': self.history
+        }
+        torch.save(checkpoint, filepath)
+        logger.info(f"Saved checkpoint to {filepath}")
+    
+    def load_checkpoint(self, filepath: str):
+        """加载检查点"""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.current_step = checkpoint['scheduler_state_dict']['current_step']
+        self.history = checkpoint['history']
+        logger.info(f"Loaded checkpoint from {filepath}")
+        return checkpoint['epoch']
+    
+    def save_history(self, filepath: str):
+        """保存训练历史"""
+        with open(filepath, 'w') as f:
+            json.dump(self.history, f, indent=4)
+        logger.info(f"Saved training history to {filepath}")
+
+
+# ============================================================================
+# 推理和翻译
+# ============================================================================
+
+class Translator:
+    """翻译器"""
+    
+    def __init__(self,
+                 model: Transformer,
+                 src_vocab: Vocabulary,
+                 tgt_vocab: Vocabulary,
+                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+                 max_seq_len: int = 128,
+                 beam_size: int = 5):
+        
+        self.model = model.to(device)
+        self.src_vocab = src_vocab
+        self.tgt_vocab = tgt_vocab
+        self.device = device
+        self.max_seq_len = max_seq_len
+        self.beam_size = beam_size
+        
+        self.model.eval()
+    
+    def translate_greedy(self, src_tokens: List[str], src_lang: str) -> str:
+        """贪心搜索翻译"""
+        # 编码源文本
+        src_indices = self.src_vocab.encode(src_tokens)
+        src_tensor = torch.tensor([src_indices], dtype=torch.long).to(self.device)
+        
+        with torch.no_grad():
+            # 编码
+            encoder_output = self.model.encode(src_tensor)
+            
+            # 初始化目标序列为<bos>
+            bos_idx = self.tgt_vocab.word2idx[Vocabulary.BOS_TOKEN]
+            eos_idx = self.tgt_vocab.word2idx[Vocabulary.EOS_TOKEN]
+            pad_idx = self.tgt_vocab.word2idx[Vocabulary.PAD_TOKEN]
+            
+            tgt_indices = [bos_idx]
+            
+            # 逐个生成令牌
+            for _ in range(self.max_seq_len):
+                tgt_tensor = torch.tensor([tgt_indices], dtype=torch.long).to(self.device)
+                
+                # 解码
+                logits = self.model.decode(
+                    tgt_tensor,
+                    encoder_output,
+                    tgt_mask=None,
+                    src_mask=None
+                )
+                
+                # 取最后一个位置的最高概率令牌
+                next_token_logits = logits[0, -1, :]
+                next_token = torch.argmax(next_token_logits).item()
+                
+                if next_token == eos_idx:
+                    break
+                
+                tgt_indices.append(next_token)
+            
+            # 解码为文本
+            tgt_tokens = self.tgt_vocab.decode(tgt_indices[1:])  # 移除<bos>
+            return ' '.join(tgt_tokens)
+    
+    def translate(self, src_text: str, src_lang: str) -> str:
+        """翻译句子"""
+        # 分词
+        from data_processor import MultilingualTokenizer
+        tokenizer = MultilingualTokenizer()
+        src_tokens = tokenizer.tokenize(src_text, src_lang)
+        
+        # 翻译
+        return self.translate_greedy(src_tokens, src_lang)
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    
+    # 配置
+    config = TransformerConfig(
+        src_vocab_size=5000,
+        tgt_vocab_size=5000,
+        d_model=512,
+        num_layers=6,
+        num_heads=8,
+        d_ff=2048,
+        max_seq_len=128,
+        dropout=0.1
+    )
+    
+    # 创建模型
+    model = Transformer(
+        src_vocab_size=config.src_vocab_size,
+        tgt_vocab_size=config.tgt_vocab_size,
+        d_model=config.d_model,
+        num_layers=config.num_layers,
+        num_heads=config.num_heads,
+        d_ff=config.d_ff,
+        max_seq_len=config.max_seq_len,
+        dropout=config.dropout
+    )
+    
+    print(f"Model created with {sum(p.numel() for p in model.parameters()):,} parameters")
