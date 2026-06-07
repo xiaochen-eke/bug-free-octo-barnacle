@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""
+训练脚本 - 基于Transformer的多语言翻译模型
+
+使用方式:
+    python train.py --lang-pair zh en --epochs 50 --batch-size 32
+
+支持的语言对:
+    zh-en, zh-ja, zh-fr, zh-de
+    en-zh, en-ja, en-fr, en-de
+    ja-zh, ja-en, ja-fr, ja-de
+    fr-zh, fr-en, fr-ja, fr-de
+    de-zh, de-en, de-ja, de-fr
+"""
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+import argparse
+import logging
+import json
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
+
+from transformer_model import Transformer, TransformerConfig
+from data_processor import (
+    OpusDatasetProcessor,
+    TranslationDataset,
+    DataCollator,
+    Vocabulary
+)
+from trainer import Trainer
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+def parse_arguments():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(
+        description='训练基于Transformer的多语言翻译模型'
+    )
+    
+    # 数据相关
+    parser.add_argument('--lang-pair', nargs=2, default=['en', 'zh'],
+                        help='语言对，例如: zh en')
+    parser.add_argument('--data-dir', default='./data',
+                        help='数据集目录')
+    parser.add_argument('--vocab-dir', default='./vocab',
+                        help='词汇表目录')
+    parser.add_argument('--max-samples', type=int, default=None,
+                        help='最大样本数')
+    parser.add_argument('--max-seq-len', type=int, default=128,
+                        help='最大序列长度')
+    
+    # 模型相关
+    parser.add_argument('--d-model', type=int, default=512,
+                        help='模型维度')
+    parser.add_argument('--num-layers', type=int, default=6,
+                        help='编码器和解码器层数')
+    parser.add_argument('--num-heads', type=int, default=8,
+                        help='多头注意力头数')
+    parser.add_argument('--d-ff', type=int, default=2048,
+                        help='前馈网络隐藏维度')
+    parser.add_argument('--dropout', type=float, default=0.1,
+                        help='Dropout比例')
+    
+    # 训练相关
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='训练轮数')
+    parser.add_argument('--batch-size', type=int, default=32,
+                        help='批大小')
+    parser.add_argument('--learning-rate', type=float, default=0.0001,
+                        help='学习率')
+    parser.add_argument('--warmup-steps', type=int, default=4000,
+                        help='预热步数')
+    parser.add_argument('--label-smoothing', type=float, default=0.1,
+                        help='标签平滑系数')
+    parser.add_argument('--gradient-clip', type=float, default=1.0,
+                        help='梯度裁剪')
+    parser.add_argument('--val-split', type=float, default=0.1,
+                        help='验证集比例')
+    
+    # 其他
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu',
+                        help='计算设备')
+    parser.add_argument('--checkpoint-dir', default='./checkpoints',
+                        help='检查点目录')
+    parser.add_argument('--log-dir', default='./logs',
+                        help='日志目录')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='随机种子')
+    parser.add_argument('--resume', default=None,
+                        help='恢复检查点路径')
+    
+    return parser.parse_args()
+
+
+def set_seed(seed: int):
+    """设置随机种子"""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def create_dataloaders(src_texts, tgt_texts, src_vocab, tgt_vocab, src_lang, tgt_lang,
+                       batch_size, max_seq_len, val_split, device):
+    """创建数据加载器"""
+    
+    # 创建数据集
+    dataset = TranslationDataset(
+        src_texts=src_texts,
+        tgt_texts=tgt_texts,
+        src_vocab=src_vocab,
+        tgt_vocab=tgt_vocab,
+        src_lang=src_lang,
+        tgt_lang=tgt_lang,
+        max_seq_len=max_seq_len
+    )
+    
+    logger.info(f"Dataset size: {len(dataset)}")
+    
+    # 划分训练集和验证集
+    val_size = int(len(dataset) * val_split)
+    train_size = len(dataset) - val_size
+    
+    train_dataset, val_dataset = random_split(
+        dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    logger.info(f"Training set: {len(train_dataset)}, Validation set: {len(val_dataset)}")
+    
+    # 创建数据加载器
+    collator = DataCollator(src_vocab, tgt_vocab, max_seq_len)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collator,
+        num_workers=2
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collator,
+        num_workers=2
+    )
+    
+    return train_loader, val_loader
+
+
+def plot_training_history(history, save_dir):
+    """绘制训练历史"""
+    
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+    
+    # 绘制损失曲线
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # 训练和验证损失
+    axes[0].plot(history['train_loss'], label='Training Loss', linewidth=2)
+    axes[0].plot(history['val_loss'], label='Validation Loss', linewidth=2)
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Training and Validation Loss')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # 学习率变化
+    axes[1].plot(history['learning_rate'], linewidth=2, color='green')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('Learning Rate')
+    axes[1].set_title('Learning Rate Schedule')
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path / 'training_history.png', dpi=150)
+    logger.info(f"Saved training history plot to {save_path / 'training_history.png'}")
+    plt.close()
+
+
+def main():
+    args = parse_arguments()
+    
+    # 设置随机种子
+    set_seed(args.seed)
+    
+    # 设置设备
+    device = torch.device(args.device)
+    logger.info(f"Using device: {device}")
+    
+    # 创建数据处理器
+    processor = OpusDatasetProcessor(
+        dataset_dir=args.data_dir,
+        min_freq=2
+    )
+    
+    src_lang, tgt_lang = args.lang_pair
+    logger.info(f"Training {src_lang}-{tgt_lang} translation model")
+    
+    # 构建词汇表
+    logger.info("Building vocabularies...")
+    src_tokens, tgt_tokens = processor.build_vocabularies(
+        (src_lang, tgt_lang),
+        max_samples=args.max_samples
+    )
+    
+    # 获取词汇表
+    src_vocab = processor.vocabularies[src_lang]
+    tgt_vocab = processor.vocabularies[tgt_lang]
+    
+    logger.info(f"Source vocabulary size: {len(src_vocab)}")
+    logger.info(f"Target vocabulary size: {len(tgt_vocab)}")
+    
+    # 保存词汇表
+    processor.save_vocabularies(args.vocab_dir)
+    
+    # 加载原始文本
+    src_texts, tgt_texts = processor.load_corpus((src_lang, tgt_lang), args.max_samples)
+    
+    # 创建数据加载器
+    train_loader, val_loader = create_dataloaders(
+        src_texts=src_texts,
+        tgt_texts=tgt_texts,
+        src_vocab=src_vocab,
+        tgt_vocab=tgt_vocab,
+        src_lang=src_lang,
+        tgt_lang=tgt_lang,
+        batch_size=args.batch_size,
+        max_seq_len=args.max_seq_len,
+        val_split=args.val_split,
+        device=device
+    )
+    
+    # 创建模型配置
+    config = TransformerConfig(
+        src_vocab_size=len(src_vocab),
+        tgt_vocab_size=len(tgt_vocab),
+        d_model=args.d_model,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        d_ff=args.d_ff,
+        max_seq_len=args.max_seq_len,
+        dropout=args.dropout
+    )
+    
+    # 保存配置
+    config_path = Path(args.checkpoint_dir) / f'config_{src_lang}_{tgt_lang}.json'
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, 'w') as f:
+        json.dump(config.to_dict(), f, indent=2)
+    logger.info(f"Saved config to {config_path}")
+    
+    # 创建模型
+    model = Transformer(
+        src_vocab_size=config.src_vocab_size,
+        tgt_vocab_size=config.tgt_vocab_size,
+        d_model=config.d_model,
+        num_layers=config.num_layers,
+        num_heads=config.num_heads,
+        d_ff=config.d_ff,
+        max_seq_len=config.max_seq_len,
+        dropout=config.dropout,
+        src_padding_idx=src_vocab.word2idx[Vocabulary.PAD_TOKEN],
+        tgt_padding_idx=tgt_vocab.word2idx[Vocabulary.PAD_TOKEN]
+    )
+    
+    # 计算模型参数数量
+    num_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Model parameters: {num_params:,}")
+    
+    # 创建训练器
+    trainer = Trainer(
+        model=model,
+        src_vocab=src_vocab,
+        tgt_vocab=tgt_vocab,
+        device=str(device),
+        learning_rate=args.learning_rate,
+        warmup_steps=args.warmup_steps,
+        label_smoothing=args.label_smoothing,
+        gradient_clip=args.gradient_clip,
+        log_dir=args.log_dir
+    )
+    
+    # 如果有检查点，加载
+    start_epoch = 0
+    if args.resume:
+        start_epoch = trainer.load_checkpoint(args.resume) + 1
+        logger.info(f"Resuming training from epoch {start_epoch}")
+    
+    # 训练模型
+    logger.info("Starting training...")
+    trainer.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=args.epochs,
+        save_dir=args.checkpoint_dir
+    )
+    
+    # 绘制训练历史
+    plot_training_history(trainer.history, args.log_dir)
+    
+    logger.info("Training completed!")
+
+
+if __name__ == '__main__':
+    main()
