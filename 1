@@ -1,0 +1,478 @@
+import os
+import json
+import pickle
+import unicodedata
+import re
+from collections import defaultdict, Counter
+from typing import List, Dict, Tuple, Set
+from pathlib import Path
+import logging
+
+import numpy as np
+import jieba
+import logging
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# 多语言分词器
+# ============================================================================
+
+class MultilingualTokenizer:
+    """支持中文、日文、英文、法文、德文的多语言分词器"""
+    
+    def __init__(self):
+        self.zh_stopwords = self._load_zh_stopwords()
+        self.en_stopwords = self._load_en_stopwords()
+    
+    @staticmethod
+    def _load_zh_stopwords():
+        """加载中文停用词"""
+        stopwords = {
+            '的', '一', '是', '在', '不', '了', '有', '和', '人', '这',
+            '中', '大', '为', '上', '个', '国', '我', '以', '要', '他',
+            '时', '来', '用', '们', '生', '到', '作', '地', '于', '出',
+            '就', '分', '对', '成', '会', '可', '主', '发', '年', '动'
+        }
+        return stopwords
+    
+    @staticmethod
+    def _load_en_stopwords():
+        """加载英文停用词"""
+        stopwords = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to',
+            'for', 'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are',
+            'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+            'should', 'could', 'may', 'might', 'must', 'can', 'this', 'that',
+            'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they'
+        }
+        return stopwords
+    
+    def tokenize_chinese(self, text: str) -> List[str]:
+        """中文分词"""
+        # 使用jieba进行中文分词
+        tokens = jieba.cut(text.strip(), cut_all=False)
+        # 过滤停用词和纯空格
+        tokens = [t for t in tokens if t.strip() and t not in self.zh_stopwords]
+        return tokens
+    
+    def tokenize_english(self, text: str) -> List[str]:
+        """英文分词"""
+        # 转换为小写
+        text = text.lower()
+        # 分词
+        tokens = re.findall(r'\b\w+\b', text)
+        # 过滤停用词
+        tokens = [t for t in tokens if t not in self.en_stopwords]
+        return tokens
+    
+    def tokenize_japanese(self, text: str) -> List[str]:
+        """日文分词"""
+        try:
+            import fugashi
+            tagger = fugashi.Tagger()
+            words = tagger(text)
+            tokens = [word.surface for word in words if word.surface.strip()]
+            return tokens
+        except ImportError:
+            logger.warning("fugashi not installed, using simple character-level tokenization for Japanese")
+            return list(text.strip())
+    
+    def tokenize_french(self, text: str) -> List[str]:
+        """法文分词"""
+        text = text.lower()
+        # 简单的空格和标点符号分词
+        tokens = re.findall(r'\b\w+\b', text)
+        return tokens
+    
+    def tokenize_german(self, text: str) -> List[str]:
+        """德文分词"""
+        text = text.lower()
+        # 简单的空格和标点符号分词
+        tokens = re.findall(r'\b\w+\b', text)
+        return tokens
+    
+    def tokenize(self, text: str, language: str) -> List[str]:
+        """通用分词接口"""
+        if language == 'zh':
+            return list(self.tokenize_chinese(text))
+        elif language == 'en':
+            return self.tokenize_english(text)
+        elif language == 'ja':
+            return self.tokenize_japanese(text)
+        elif language == 'fr':
+            return self.tokenize_french(text)
+        elif language == 'de':
+            return self.tokenize_german(text)
+        else:
+            raise ValueError(f"Unsupported language: {language}")
+
+
+# ============================================================================
+# 文本预处理
+# ============================================================================
+
+class TextPreprocessor:
+    """文本规范化和清洗"""
+    
+    @staticmethod
+    def normalize_unicode(text: str) -> str:
+        """Unicode规范化"""
+        return unicodedata.normalize('NFKC', text)
+    
+    @staticmethod
+    def remove_control_chars(text: str) -> str:
+        """移除控制字符"""
+        return ''.join(ch for ch in text if unicodedata.category(ch)[0] != 'C')
+    
+    @staticmethod
+    def remove_extra_whitespace(text: str) -> str:
+        """移除多余空白"""
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+    
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """综合文本清洗"""
+        # Unicode规范化
+        text = TextPreprocessor.normalize_unicode(text)
+        # 移除控制字符
+        text = TextPreprocessor.remove_control_chars(text)
+        # 移除多余空白
+        text = TextPreprocessor.remove_extra_whitespace(text)
+        return text
+    
+    @staticmethod
+    def remove_urls(text: str) -> str:
+        """移除URL"""
+        text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
+        return text
+    
+    @staticmethod
+    def remove_emails(text: str) -> str:
+        """移除邮箱"""
+        text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '', text)
+        return text
+    
+    @staticmethod
+    def remove_special_chars(text: str) -> str:
+        """移除特殊字符（保留基本标点）"""
+        text = re.sub(r'[^\w\s\u4e00-\u9fff\u3040-\u309f\u3400-\u4dbfぁ-ゞァ-ヴー一-龠々〆〤\u00c0-\u024f]', ' ', text)
+        return text
+
+
+# ============================================================================
+# 词汇表构建
+# ============================================================================
+
+class Vocabulary:
+    """词汇表管理"""
+    
+    # 特殊标记
+    PAD_TOKEN = '<pad>'
+    BOS_TOKEN = '<bos>'
+    EOS_TOKEN = '<eos>'
+    UNK_TOKEN = '<unk>'
+    
+    def __init__(self, min_freq: int = 2):
+        self.min_freq = min_freq
+        self.word2idx = {}
+        self.idx2word = {}
+        self.word_freq = Counter()
+        self._init_special_tokens()
+    
+    def _init_special_tokens(self):
+        """初始化特殊标记"""
+        special_tokens = [
+            self.PAD_TOKEN,
+            self.BOS_TOKEN,
+            self.EOS_TOKEN,
+            self.UNK_TOKEN
+        ]
+        for token in special_tokens:
+            idx = len(self.word2idx)
+            self.word2idx[token] = idx
+            self.idx2word[idx] = token
+    
+    def build_vocab(self, tokens_list: List[List[str]]):
+        """从令牌列表构建词汇表"""
+        # 统计词频
+        for tokens in tokens_list:
+            self.word_freq.update(tokens)
+        
+        # 添加高频词汇
+        for word, freq in self.word_freq.items():
+            if freq >= self.min_freq:
+                idx = len(self.word2idx)
+                self.word2idx[word] = idx
+                self.idx2word[idx] = word
+    
+    def encode(self, tokens: List[str]) -> List[int]:
+        """将令牌编码为索引"""
+        return [
+            self.word2idx.get(token, self.word2idx[self.UNK_TOKEN])
+            for token in tokens
+        ]
+    
+    def decode(self, indices: List[int]) -> List[str]:
+        """将索引解码为令牌"""
+        return [self.idx2word.get(idx, self.UNK_TOKEN) for idx in indices]
+    
+    def __len__(self):
+        return len(self.word2idx)
+    
+    def save(self, filepath: str):
+        """保存词汇表"""
+        with open(filepath, 'wb') as f:
+            pickle.dump({
+                'word2idx': self.word2idx,
+                'idx2word': self.idx2word,
+                'word_freq': self.word_freq,
+                'min_freq': self.min_freq
+            }, f)
+    
+    def load(self, filepath: str):
+        """加载词汇表"""
+        with open(filepath, 'rb') as f:
+            data = pickle.load(f)
+            self.word2idx = data['word2idx']
+            self.idx2word = data['idx2word']
+            self.word_freq = data['word_freq']
+            self.min_freq = data['min_freq']
+
+
+# ============================================================================
+# 数据集处理
+# ============================================================================
+
+class OpusDatasetProcessor:
+    """Opus-100数据集处理器"""
+    
+    LANGUAGE_PAIRS = [
+        ('zh', 'en'), ('zh', 'ja'), ('zh', 'fr'), ('zh', 'de'),
+        ('en', 'zh'), ('en', 'ja'), ('en', 'fr'), ('en', 'de'),
+        ('ja', 'zh'), ('ja', 'en'), ('ja', 'fr'), ('ja', 'de'),
+        ('fr', 'zh'), ('fr', 'en'), ('fr', 'ja'), ('fr', 'de'),
+        ('de', 'zh'), ('de', 'en'), ('de', 'ja'), ('de', 'fr'),
+    ]
+    
+    def __init__(self, dataset_dir: str = './data', min_freq: int = 2):
+        self.dataset_dir = Path(dataset_dir)
+        self.dataset_dir.mkdir(parents=True, exist_ok=True)
+        self.min_freq = min_freq
+        
+        self.preprocessor = TextPreprocessor()
+        self.tokenizer = MultilingualTokenizer()
+        self.vocabularies = {}  # {language: Vocabulary}
+    
+    def load_corpus(self, lang_pair: Tuple[str, str], max_samples: int = None) -> Tuple[List[str], List[str]]:
+        """
+        加载平行语料
+        
+        由于直接从Opus-100获取数据较复杂，这里演示如何处理已有的平行文本文件
+        实际使用时可从以下来源加载：
+        - https://object.pouta.csc.fi/OPUS-100/
+        - Hugging Face datasets (opus_books, opus_euparl等)
+        """
+        src_lang, tgt_lang = lang_pair
+        src_file = self.dataset_dir / f'train.{src_lang}'
+        tgt_file = self.dataset_dir / f'train.{tgt_lang}'
+        
+        src_texts, tgt_texts = [], []
+        
+        if src_file.exists() and tgt_file.exists():
+            with open(src_file, 'r', encoding='utf-8') as f:
+                src_texts = [line.strip() for line in f if line.strip()]
+            
+            with open(tgt_file, 'r', encoding='utf-8') as f:
+                tgt_texts = [line.strip() for line in f if line.strip()]
+            
+            # 确保长度相等
+            min_len = min(len(src_texts), len(tgt_texts))
+            src_texts = src_texts[:min_len]
+            tgt_texts = tgt_texts[:min_len]
+            
+            if max_samples:
+                src_texts = src_texts[:max_samples]
+                tgt_texts = tgt_texts[:max_samples]
+        
+        return src_texts, tgt_texts
+    
+    def preprocess_and_tokenize(self, texts: List[str], language: str) -> List[List[str]]:
+        """预处理和分词"""
+        processed = []
+        for text in texts:
+            # 清洗
+            text = self.preprocessor.clean_text(text)
+            # 移除URL和邮箱
+            text = self.preprocessor.remove_urls(text)
+            text = self.preprocessor.remove_emails(text)
+            # 分词
+            tokens = self.tokenizer.tokenize(text, language)
+            processed.append(tokens)
+        
+        return processed
+    
+    def build_vocabularies(self, lang_pair: Tuple[str, str], max_samples: int = None):
+        """为语言对构建词汇表"""
+        src_lang, tgt_lang = lang_pair
+        
+        logger.info(f"Loading corpus for {src_lang}-{tgt_lang}...")
+        src_texts, tgt_texts = self.load_corpus(lang_pair, max_samples)
+        
+        logger.info(f"Preprocessing and tokenizing {src_lang}...")
+        src_tokens = self.preprocess_and_tokenize(src_texts, src_lang)
+        
+        logger.info(f"Preprocessing and tokenizing {tgt_lang}...")
+        tgt_tokens = self.preprocess_and_tokenize(tgt_texts, tgt_lang)
+        
+        # 构建词汇表
+        if src_lang not in self.vocabularies:
+            logger.info(f"Building vocabulary for {src_lang}...")
+            src_vocab = Vocabulary(min_freq=self.min_freq)
+            src_vocab.build_vocab(src_tokens)
+            self.vocabularies[src_lang] = src_vocab
+        
+        if tgt_lang not in self.vocabularies:
+            logger.info(f"Building vocabulary for {tgt_lang}...")
+            tgt_vocab = Vocabulary(min_freq=self.min_freq)
+            tgt_vocab.build_vocab(tgt_tokens)
+            self.vocabularies[tgt_lang] = tgt_vocab
+        
+        return src_tokens, tgt_tokens
+    
+    def save_vocabularies(self, vocab_dir: str = './vocab'):
+        """保存所有词汇表"""
+        vocab_path = Path(vocab_dir)
+        vocab_path.mkdir(parents=True, exist_ok=True)
+        
+        for lang, vocab in self.vocabularies.items():
+            filepath = vocab_path / f'vocab_{lang}.pkl'
+            vocab.save(str(filepath))
+            logger.info(f"Saved vocabulary for {lang} to {filepath}")
+    
+    def load_vocabularies(self, vocab_dir: str = './vocab'):
+        """加载所有词汇表"""
+        vocab_path = Path(vocab_dir)
+        
+        for lang_file in vocab_path.glob('vocab_*.pkl'):
+            lang = lang_file.stem.replace('vocab_', '')
+            vocab = Vocabulary()
+            vocab.load(str(lang_file))
+            self.vocabularies[lang] = vocab
+            logger.info(f"Loaded vocabulary for {lang} from {lang_file}")
+
+
+# ============================================================================
+# 数据加载器
+# ============================================================================
+
+class TranslationDataset:
+    """翻译数据集"""
+    
+    def __init__(self, 
+                 src_texts: List[str],
+                 tgt_texts: List[str],
+                 src_vocab: Vocabulary,
+                 tgt_vocab: Vocabulary,
+                 src_lang: str,
+                 tgt_lang: str,
+                 max_seq_len: int = 128):
+        
+        self.src_vocab = src_vocab
+        self.tgt_vocab = tgt_vocab
+        self.max_seq_len = max_seq_len
+        
+        # 预处理
+        preprocessor = TextPreprocessor()
+        tokenizer = MultilingualTokenizer()
+        
+        self.src_samples = []
+        self.tgt_samples = []
+        
+        for src_text, tgt_text in zip(src_texts, tgt_texts):
+            # 清洗
+            src_text = preprocessor.clean_text(src_text)
+            tgt_text = preprocessor.clean_text(tgt_text)
+            
+            # 分词
+            src_tokens = tokenizer.tokenize(src_text, src_lang)
+            tgt_tokens = tokenizer.tokenize(tgt_text, tgt_lang)
+            
+            # 长度过滤
+            if len(src_tokens) > max_seq_len or len(tgt_tokens) > max_seq_len:
+                continue
+            
+            # 编码
+            src_indices = src_vocab.encode(src_tokens)
+            tgt_indices = tgt_vocab.encode(tgt_tokens)
+            
+            self.src_samples.append(src_indices)
+            self.tgt_samples.append(tgt_indices)
+    
+    def __len__(self):
+        return len(self.src_samples)
+    
+    def __getitem__(self, idx):
+        return {
+            'src': np.array(self.src_samples[idx]),
+            'tgt': np.array(self.tgt_samples[idx])
+        }
+
+
+class DataCollator:
+    """数据批处理器"""
+    
+    def __init__(self, src_vocab: Vocabulary, tgt_vocab: Vocabulary, max_seq_len: int = 128):
+        self.src_vocab = src_vocab
+        self.tgt_vocab = tgt_vocab
+        self.max_seq_len = max_seq_len
+        self.pad_idx = src_vocab.word2idx[Vocabulary.PAD_TOKEN]
+    
+    def __call__(self, batch: List[Dict]):
+        """批处理"""
+        src_seqs = [item['src'] for item in batch]
+        tgt_seqs = [item['tgt'] for item in batch]
+        
+        # 填充
+        src_padded = self._pad_sequences(src_seqs, self.src_vocab)
+        tgt_padded = self._pad_sequences(tgt_seqs, self.tgt_vocab)
+        
+        # 创建注意力掩码
+        src_mask = (src_padded != self.pad_idx).astype(np.float32)
+        tgt_mask = (tgt_padded != self.tgt_vocab.word2idx[Vocabulary.PAD_TOKEN]).astype(np.float32)
+        
+        return {
+            'src': src_padded,
+            'tgt': tgt_padded,
+            'src_mask': src_mask,
+            'tgt_mask': tgt_mask
+        }
+    
+    def _pad_sequences(self, sequences: List[np.ndarray], vocab: Vocabulary) -> np.ndarray:
+        """填充序列到最大长度"""
+        pad_idx = vocab.word2idx[Vocabulary.PAD_TOKEN]
+        padded = np.full((len(sequences), self.max_seq_len), pad_idx, dtype=np.int64)
+        
+        for i, seq in enumerate(sequences):
+            length = min(len(seq), self.max_seq_len)
+            padded[i, :length] = seq[:length]
+        
+        return padded
+
+
+if __name__ == '__main__':
+    # 示例用法
+    processor = OpusDatasetProcessor(dataset_dir='./data')
+    
+    # 构建中英翻译对的词汇表（示例）
+    print("Building vocabularies for zh-en...")
+    src_tokens, tgt_tokens = processor.build_vocabularies(('zh', 'en'), max_samples=10000)
+    
+    # 保存词汇表
+    processor.save_vocabularies('./vocab')
+    
+    print(f"Source vocabulary size: {len(processor.vocabularies['zh'])}")
+    print(f"Target vocabulary size: {len(processor.vocabularies['en'])}")
