@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""
+推理脚本 - 模型推理和翻译演示
+
+使用方式:
+    # 交互式翻译
+    python inference.py --lang-pair zh en --interactive
+    
+    # 文件翻译
+    python inference.py --lang-pair zh en --input input.txt --output output.txt
+    
+    # 模型评估
+    python inference.py --lang-pair zh en --eval --ref-file reference.txt --hyp-file hypothesis.txt
+"""
+
+import torch
+import argparse
+import logging
+import json
+from pathlib import Path
+import pickle
+from typing import List
+
+from transformer_model import Transformer, TransformerConfig
+from data_processor import Vocabulary, MultilingualTokenizer
+from trainer import Translator, BLEUScorer
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class InferenceEngine:
+    """推理引擎"""
+    
+    def __init__(self, 
+                 model_dir: str = './checkpoints',
+                 vocab_dir: str = './vocab',
+                 lang_pair: tuple = ('en', 'zh'),
+                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+                 beam_size: int = 5):
+        
+        self.model_dir = Path(model_dir)
+        self.vocab_dir = Path(vocab_dir)
+        self.lang_pair = lang_pair
+        self.device = device
+        self.beam_size = beam_size
+        
+        # 加载词汇表
+        self.src_vocab, self.tgt_vocab = self._load_vocabularies()
+        
+        # 加载模型
+        self.translator = self._load_model()
+        
+        logger.info(f"Inference engine initialized for {lang_pair[0]}-{lang_pair[1]}")
+    
+    def _load_vocabularies(self) -> tuple:
+        """加载词汇表"""
+        src_lang, tgt_lang = self.lang_pair
+        
+        src_vocab_path = self.vocab_dir / f'vocab_{src_lang}.pkl'
+        tgt_vocab_path = self.vocab_dir / f'vocab_{tgt_lang}.pkl'
+        
+        src_vocab = Vocabulary()
+        tgt_vocab = Vocabulary()
+        
+        if src_vocab_path.exists():
+            with open(src_vocab_path, 'rb') as f:
+                data = pickle.load(f)
+                src_vocab.word2idx = data['word2idx']
+                src_vocab.idx2word = data['idx2word']
+                src_vocab.word_freq = data['word_freq']
+                src_vocab.min_freq = data['min_freq']
+        else:
+            logger.warning(f"Source vocabulary not found at {src_vocab_path}")
+        
+        if tgt_vocab_path.exists():
+            with open(tgt_vocab_path, 'rb') as f:
+                data = pickle.load(f)
+                tgt_vocab.word2idx = data['word2idx']
+                tgt_vocab.idx2word = data['idx2word']
+                tgt_vocab.word_freq = data['word_freq']
+                tgt_vocab.min_freq = data['min_freq']
+        else:
+            logger.warning(f"Target vocabulary not found at {tgt_vocab_path}")
+        
+        return src_vocab, tgt_vocab
+    
+    def _load_model(self) -> Translator:
+        """加载模型"""
+        src_lang, tgt_lang = self.lang_pair
+        
+        config_path = self.model_dir / f'config_{src_lang}_{tgt_lang}.json'
+        checkpoint_path = self.model_dir / f'model_{src_lang}_{tgt_lang}.pt'
+        
+        # 加载配置
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                config_dict = json.load(f)
+            config = TransformerConfig.from_dict(config_dict)
+        else:
+            logger.warning("Config file not found, using default config")
+            config = TransformerConfig(
+                src_vocab_size=len(self.src_vocab),
+                tgt_vocab_size=len(self.tgt_vocab)
+            )
+        
+        # 创建模型
+        model = Transformer(
+            src_vocab_size=config.src_vocab_size,
+            tgt_vocab_size=config.tgt_vocab_size,
+            d_model=config.d_model,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            d_ff=config.d_ff,
+            max_seq_len=config.max_seq_len,
+            dropout=config.dropout
+        )
+        
+        # 加载权重
+        if checkpoint_path.exists():
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            
+            logger.info(f"Loaded model from {checkpoint_path}")
+        else:
+            logger.warning(f"Checkpoint not found at {checkpoint_path}")
+        
+        # 创建翻译器
+        translator = Translator(
+            model=model,
+            src_vocab=self.src_vocab,
+            tgt_vocab=self.tgt_vocab,
+            device=self.device,
+            max_seq_len=config.max_seq_len,
+            beam_size=self.beam_size
+        )
+        
+        return translator
+    
+    def translate(self, text: str) -> str:
+        """翻译文本"""
+        src_lang, _ = self.lang_pair
+        return self.translator.translate(text, src_lang)
+    
+    def translate_batch(self, texts: List[str]) -> List[str]:
+        """批量翻译"""
+        return [self.translate(text) for text in texts]
+    
+    def translate_file(self, input_path: str, output_path: str = None):
+        """翻译文件"""
+        if output_path is None:
+            output_path = input_path.replace('.txt', '_translated.txt')
+        
+        # 读取文件
+        with open(input_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # 翻译
+        translated_lines = []
+        for i, line in enumerate(lines):
+            if line.strip():
+                try:
+                    translated_line = self.translate(line.strip())
+                    translated_lines.append(translated_line + '\n')
+                except Exception as e:
+                    logger.error(f"Error translating line {i+1}: {e}")
+                    translated_lines.append(f"[ERROR] {e}\n")
+            else:
+                translated_lines.append('\n')
+        
+        # 写入文件
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.writelines(translated_lines)
+        
+        logger.info(f"Translated file saved to {output_path}")
+    
+    def evaluate_bleu(self, references_path: str, hypotheses_path: str):
+        """计算BLEU分数"""
+        
+        # 读取参考翻译
+        with open(references_path, 'r', encoding='utf-8') as f:
+            references = [line.strip().split() for line in f if line.strip()]
+        
+        # 读取假设翻译
+        with open(hypotheses_path, 'r', encoding='utf-8') as f:
+            hypotheses = [line.strip().split() for line in f if line.strip()]
+        
+        # 确保长度相同
+        min_len = min(len(references), len(hypotheses))
+        references = references[:min_len]
+        hypotheses = hypotheses[:min_len]
+        
+        # 计算BLEU分数
+        list_of_references = [[ref] for ref in references]
+        bleu_score = BLEUScorer.corpus_bleu(list_of_references, hypotheses)
+        
+        logger.info(f"BLEU Score: {bleu_score:.4f}")
+        return bleu_score
+
+
+def parse_arguments():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='推理和翻译')
+    
+    parser.add_argument('--lang-pair', nargs=2, default=['en', 'zh'],
+                        help='语言对')
+    parser.add_argument('--model-dir', default='./checkpoints',
+                        help='模型目录')
+    parser.add_argument('--vocab-dir', default='./vocab',
+                        help='词汇表目录')
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu',
+                        help='计算设备')
+    
+    # 模式选择
+    parser.add_argument('--interactive', action='store_true',
+                        help='交互式翻译模式')
+    parser.add_argument('--input', type=str,
+                        help='输入文件路径')
+    parser.add_argument('--output', type=str,
+                        help='输出文件路径')
+    parser.add_argument('--eval', action='store_true',
+                        help='评估模式')
+    parser.add_argument('--ref-file', type=str,
+                        help='参考翻译文件')
+    parser.add_argument('--hyp-file', type=str,
+                        help='假设翻译文件')
+    
+    parser.add_argument('--beam-size', type=int, default=5,
+                        help='束搜索大小')
+    
+    return parser.parse_args()
+
+
+def interactive_mode(engine: InferenceEngine):
+    """交互式翻译模式"""
+    print("\n" + "="*60)
+    print(f"交互式翻译模式 ({engine.lang_pair[0]} -> {engine.lang_pair[1]})")
+    print("输入 'quit' 或 'exit' 退出")
+    print("="*60 + "\n")
+    
+    while True:
+        try:
+            text = input(f"输入文本 ({engine.lang_pair[0]}): ").strip()
+            
+            if text.lower() in ['quit', 'exit']:
+                break
+            
+            if not text:
+                continue
+            
+            translation = engine.translate(text)
+            print(f"翻译结果 ({engine.lang_pair[1]}): {translation}\n")
+        
+        except KeyboardInterrupt:
+            print("\n再见!")
+            break
+        except Exception as e:
+            print(f"错误: {e}\n")
+
+
+def file_mode(engine: InferenceEngine, input_path: str, output_path: str = None):
+    """文件翻译模式"""
+    if not Path(input_path).exists():
+        logger.error(f"Input file not found: {input_path}")
+        return
+    
+    logger.info(f"Translating file: {input_path}")
+    engine.translate_file(input_path, output_path)
+
+
+def eval_mode(engine: InferenceEngine, ref_file: str, hyp_file: str):
+    """评估模式"""
+    if not Path(ref_file).exists():
+        logger.error(f"Reference file not found: {ref_file}")
+        return
+    
+    if not Path(hyp_file).exists():
+        logger.error(f"Hypothesis file not found: {hyp_file}")
+        return
+    
+    logger.info("Evaluating translation quality...")
+    engine.evaluate_bleu(ref_file, hyp_file)
+
+
+def main():
+    args = parse_arguments()
+    
+    # 创建推理引擎
+    engine = InferenceEngine(
+        model_dir=args.model_dir,
+        vocab_dir=args.vocab_dir,
+        lang_pair=tuple(args.lang_pair),
+        device=args.device,
+        beam_size=args.beam_size
+    )
+    
+    # 选择模式
+    if args.interactive:
+        interactive_mode(engine)
+    
+    elif args.input:
+        file_mode(engine, args.input, args.output)
+    
+    elif args.eval and args.ref_file and args.hyp_file:
+        eval_mode(engine, args.ref_file, args.hyp_file)
+    
+    else:
+        # 默认演示模式
+        print("\n" + "="*60)
+        print("翻译演示 (Translation Demo)")
+        print("="*60 + "\n")
+        
+        # 示例文本
+        examples = {
+            ('en', 'zh'): [
+                "Hello, how are you?",
+                "Machine translation is a challenging task.",
+                "The Transformer model has revolutionized NLP."
+            ],
+            ('zh', 'en'): [
+                "你好，你好吗？",
+                "机器翻译是一项具有挑战性的任务。",
+                "Transformer模型彻底改变了自然语言处理。"
+            ],
+            ('en', 'ja'): [
+                "Good morning!",
+                "How are you today?",
+            ],
+            ('en', 'fr'): [
+                "Welcome!",
+                "Machine translation is useful.",
+            ],
+            ('en', 'de'): [
+                "Hello world!",
+                "Neural machine translation is advanced.",
+            ]
+        }
+        
+        lang_pair = tuple(args.lang_pair)
+        if lang_pair in examples:
+            for text in examples[lang_pair]:
+                print(f"源语言 ({lang_pair[0]}): {text}")
+                translation = engine.translate(text)
+                print(f"目标语言 ({lang_pair[1]}): {translation}")
+                print()
+
+
+if __name__ == '__main__':
+    main()
